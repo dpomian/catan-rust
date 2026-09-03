@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
@@ -243,22 +244,53 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
 
                         if let Some(room_arc) = room_arc {
-                            let result = {
+                            let (result, trade_id) = {
                                 let mut room = room_arc.lock().unwrap();
                                 if let Some(game) = room.game.as_mut() {
-                                    game.apply_action(pid, action)
+                                    let result = game.apply_action(pid, action);
+                                    let trade_id = if result.is_ok() {
+                                        game.pending_trade
+                                            .as_ref()
+                                            .filter(|t| t.from == pid)
+                                            .map(|t| t.trade_id)
+                                    } else {
+                                        None
+                                    };
+                                    (Some(result), trade_id)
                                 } else {
-                                    Err(CatanError::InvalidPhase)
+                                    (Some(Err(CatanError::InvalidPhase)), None)
                                 }
                             };
 
+                            let is_ok = matches!(result, Some(Ok(())));
+                            if is_ok && trade_id.is_some() {
+                                let trade_id = trade_id.unwrap();
+                                let room_for_timer = room_arc.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(15)).await;
+                                    let cancelled = {
+                                        let mut room = room_for_timer.lock().unwrap();
+                                        if let Some(game) = room.game.as_mut() {
+                                            game.apply_action(pid, Action::CancelTrade { trade_id })
+                                                .is_ok()
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if cancelled {
+                                        broadcast_game_state(&room_for_timer).await;
+                                    }
+                                });
+                            }
+
                             match result {
-                                Ok(_) => broadcast_game_state(&room_arc).await,
-                                Err(e) => {
+                                Some(Ok(_)) => broadcast_game_state(&room_arc).await,
+                                Some(Err(e)) => {
                                     let _ = tx.send(ServerMessage::Error {
                                         message: e.to_string(),
                                     });
                                 }
+                                None => {}
                             }
                         }
                     }

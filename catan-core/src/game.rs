@@ -48,16 +48,18 @@ pub enum Action {
     PlayInvention(Resource, Resource),
     PlayMonopoly(Resource),
     OfferTrade {
-        to: PlayerId,
         give: Resources,
         receive: Resources,
     },
     RespondTrade {
         accept: bool,
     },
+    CancelTrade {
+        trade_id: u64,
+    },
     BankTrade {
-        give: Resource,
-        receive: Resource,
+        give: Resources,
+        receive: Resources,
     },
     EndTurn,
 }
@@ -77,6 +79,7 @@ pub struct Game {
     pub development_deck: Vec<DevelopmentCard>,
     pub winner: Option<PlayerId>,
     pub played_dev_card_this_turn: bool,
+    pub trade_counter: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +214,7 @@ impl Game {
             development_deck: deck,
             winner: None,
             played_dev_card_this_turn: false,
+            trade_counter: 0,
         })
     }
 
@@ -431,8 +435,11 @@ impl Game {
             (TurnPhase::Main, Action::PlayMonopoly(resource)) => {
                 self.play_monopoly(player, resource)
             }
-            (TurnPhase::Main, Action::OfferTrade { to, give, receive }) => {
-                self.offer_trade(player, to, give, receive)
+            (TurnPhase::Main, Action::OfferTrade { give, receive }) => {
+                self.offer_trade(player, give, receive)
+            }
+            (TurnPhase::Main, Action::CancelTrade { trade_id }) => {
+                self.cancel_trade(player, trade_id)
             }
             (TurnPhase::Main, Action::BankTrade { give, receive }) => {
                 self.bank_trade(player, give, receive)
@@ -838,110 +845,98 @@ impl Game {
         Ok(())
     }
 
-    /// Offer a trade to another player after verifying both sides can pay.
+    /// Offer a trade to all other players after verifying the offer is non-empty and the initiator can pay.
     fn offer_trade(
         &mut self,
         from: PlayerId,
-        to: PlayerId,
         give: Resources,
         receive: Resources,
     ) -> Result<(), CatanError> {
-        if from == to || to >= self.players.len() {
+        if give.total() == 0 || receive.total() == 0 {
             return Err(CatanError::InvalidTrade);
         }
         if !self.players[from].resources.can_afford(&give) {
             return Err(CatanError::NotEnoughResources);
         }
-        if !self.players[to].resources.can_afford(&receive) {
-            return Err(CatanError::InvalidTrade);
-        }
 
+        let trade_id = self.trade_counter;
+        self.trade_counter = self.trade_counter.wrapping_add(1);
         self.pending_trade = Some(TradeOffer {
+            trade_id,
             from,
-            to,
             give,
             receive,
+            rejected_by: Vec::new(),
         });
         Ok(())
     }
 
-    /// Accept or decline a pending trade, restoring the offer if it was for someone else.
+    /// Cancel a pending trade. Only the initiator can cancel, and only if the trade id matches.
+    fn cancel_trade(&mut self, player: PlayerId, trade_id: u64) -> Result<(), CatanError> {
+        let trade = self
+            .pending_trade
+            .as_ref()
+            .ok_or(CatanError::NoPendingTrade)?;
+        if trade.from != player || trade.trade_id != trade_id {
+            return Err(CatanError::TradeNotForYou);
+        }
+        self.pending_trade = None;
+        Ok(())
+    }
+
+    /// Accept or decline a pending broadcast trade. Anyone except the initiator may respond;
+    /// accepting executes the trade with the responding player.
     fn handle_trade_response(&mut self, player: PlayerId, accept: bool) -> Result<(), CatanError> {
         let trade = self
             .pending_trade
-            .take()
-            .ok_or(CatanError::NoPendingTrade)?;
-        if trade.to != player {
-            // Restore the offer if it wasn't for this player.
-            self.pending_trade = Some(trade);
+            .as_ref()
+            .ok_or(CatanError::NoPendingTrade)?
+            .clone();
+        if trade.from == player {
             return Err(CatanError::TradeNotForYou);
         }
 
         if !accept {
+            if let Some(offer) = self.pending_trade.as_mut()
+                && !offer.rejected_by.contains(&player)
+            {
+                offer.rejected_by.push(player);
+            }
             return Ok(());
         }
 
         if !self.players[trade.from].resources.can_afford(&trade.give)
-            || !self.players[trade.to].resources.can_afford(&trade.receive)
+            || !self.players[player].resources.can_afford(&trade.receive)
         {
             return Err(CatanError::InvalidTrade);
         }
 
-        self.transfer_resources(trade.from, trade.to, &trade.give)?;
-        self.transfer_resources(trade.to, trade.from, &trade.receive)?;
+        self.transfer_resources(trade.from, player, &trade.give)?;
+        self.transfer_resources(player, trade.from, &trade.receive)?;
+        self.pending_trade = None;
         Ok(())
     }
 
-    /// Exchange resources with the bank at the player's best port rate.
+    /// Exchange any bundle of resources with the bank. The bank always accepts as long as the
+    /// player can afford what they are giving and the offer is non-empty.
     fn bank_trade(
         &mut self,
         player: PlayerId,
-        give: Resource,
-        receive: Resource,
+        give: Resources,
+        receive: Resources,
     ) -> Result<(), CatanError> {
-        if give == receive {
+        if give.total() == 0 || receive.total() == 0 {
             return Err(CatanError::InvalidTrade);
         }
 
-        let rate = self.best_trade_rate(player, give);
         let p = &mut self.players[player];
-        if p.resources.get(give) < rate {
+        if !p.resources.can_afford(&give) {
             return Err(CatanError::NotEnoughResources);
         }
 
-        p.resources.sub(give, rate);
-        p.resources.add(receive, 1);
+        p.resources.sub_resources(&give);
+        p.resources.add_resources(&receive);
         Ok(())
-    }
-
-    /// Find the cheapest exchange rate for a resource based on ports the player touches.
-    fn best_trade_rate(&self, player: PlayerId, resource: Resource) -> u8 {
-        let mut best = 4u8;
-        for vertex_id in self.settlements_and_cities(player) {
-            if let Some(port) = self.board.vertices[vertex_id].port {
-                match port {
-                    Port::Generic3To1 => best = best.min(3),
-                    Port::Specific2To1(r) if r == resource => best = best.min(2),
-                    _ => {}
-                }
-            }
-        }
-        best
-    }
-
-    /// Return the vertices occupied by this player's settlements and cities.
-    fn settlements_and_cities(&self, player: PlayerId) -> Vec<VertexId> {
-        self.board
-            .vertices
-            .iter()
-            .filter(|v| {
-                matches!(
-                    v.building,
-                    Some(Building::Settlement(pid) | Building::City(pid)) if pid == player
-                )
-            })
-            .map(|v| v.id)
-            .collect()
     }
 
     /// Move unplayed dev cards to hand, clear turn state, and advance to the next player.
@@ -1994,7 +1989,6 @@ mod tests {
         game.apply_action(
             from,
             Action::OfferTrade {
-                to,
                 give: Resources {
                     brick: 1,
                     ..Default::default()
@@ -2034,7 +2028,6 @@ mod tests {
         game.apply_action(
             from,
             Action::OfferTrade {
-                to,
                 give: Resources {
                     brick: 1,
                     ..Default::default()
@@ -2049,6 +2042,7 @@ mod tests {
         game.apply_action(to, Action::RespondTrade { accept: false })
             .unwrap();
 
+        assert!(game.pending_trade.is_some());
         assert_eq!(game.players[from].resources.brick, 2);
         assert_eq!(game.players[from].resources.lumber, 0);
         assert_eq!(game.players[to].resources.brick, 0);
@@ -2056,7 +2050,40 @@ mod tests {
     }
 
     #[test]
-    fn cannot_trade_with_self() {
+    fn cancel_trade_withdraws_offer() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let from = game.current_player();
+        game.players[from].resources = Resources {
+            brick: 2,
+            ..Default::default()
+        };
+
+        game.apply_action(
+            from,
+            Action::OfferTrade {
+                give: Resources {
+                    brick: 1,
+                    ..Default::default()
+                },
+                receive: Resources {
+                    lumber: 1,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let trade_id = game.pending_trade.as_ref().unwrap().trade_id;
+        assert!(game.pending_trade.is_some());
+
+        game.apply_action(from, Action::CancelTrade { trade_id })
+            .unwrap();
+        assert!(game.pending_trade.is_none());
+    }
+
+    #[test]
+    fn empty_trade_offer_is_invalid() {
         let mut game = Game::new(make_players()).unwrap();
         run_setup(&mut game);
         enter_main_phase(&mut game);
@@ -2065,7 +2092,6 @@ mod tests {
             game.apply_action(
                 player,
                 Action::OfferTrade {
-                    to: player,
                     give: Resources::zero(),
                     receive: Resources::zero(),
                 }
@@ -2076,79 +2102,41 @@ mod tests {
     }
 
     #[test]
-    fn bank_trade_uses_best_port_rate() {
+    fn bank_trade_exchanges_resource_bundles() {
         let mut game = Game::new(make_players()).unwrap();
         run_setup(&mut game);
         enter_main_phase(&mut game);
         let player = game.current_player();
 
-        // 4:1 with no port.
         game.players[player].resources = Resources {
-            brick: 4,
+            brick: 2,
+            lumber: 1,
             ..Default::default()
         };
         game.apply_action(
             player,
             Action::BankTrade {
-                give: Resource::Brick,
-                receive: Resource::Lumber,
+                give: Resources {
+                    brick: 1,
+                    lumber: 1,
+                    ..Default::default()
+                },
+                receive: Resources {
+                    ore: 1,
+                    grain: 1,
+                    ..Default::default()
+                },
             },
         )
         .unwrap();
-        assert_eq!(game.players[player].resources.brick, 0);
-        assert_eq!(game.players[player].resources.lumber, 1);
-
-        // 3:1 with a generic-port settlement.
-        let generic_port_vertex = game
-            .board
-            .vertices
-            .iter()
-            .find(|v| v.is_coastal() && v.port == Some(Port::Generic3To1))
-            .map(|v| v.id)
-            .unwrap();
-        game.board.vertices[generic_port_vertex].building = Some(Building::Settlement(player));
-        game.players[player].resources = Resources {
-            lumber: 3,
-            ..Default::default()
-        };
-        game.apply_action(
-            player,
-            Action::BankTrade {
-                give: Resource::Lumber,
-                receive: Resource::Ore,
-            },
-        )
-        .unwrap();
+        assert_eq!(game.players[player].resources.brick, 1);
         assert_eq!(game.players[player].resources.lumber, 0);
         assert_eq!(game.players[player].resources.ore, 1);
-
-        // 2:1 with a specific-port settlement.
-        let ore_port_vertex = game
-            .board
-            .vertices
-            .iter()
-            .find(|v| v.is_coastal() && v.port == Some(Port::Specific2To1(Resource::Ore)))
-            .map(|v| v.id)
-            .unwrap();
-        game.board.vertices[ore_port_vertex].building = Some(Building::Settlement(player));
-        game.players[player].resources = Resources {
-            ore: 2,
-            ..Default::default()
-        };
-        game.apply_action(
-            player,
-            Action::BankTrade {
-                give: Resource::Ore,
-                receive: Resource::Grain,
-            },
-        )
-        .unwrap();
-        assert_eq!(game.players[player].resources.ore, 0);
         assert_eq!(game.players[player].resources.grain, 1);
     }
 
     #[test]
-    fn bank_trade_same_resource_is_invalid() {
+    fn empty_bank_trade_is_invalid() {
         let mut game = Game::new(make_players()).unwrap();
         run_setup(&mut game);
         enter_main_phase(&mut game);
@@ -2161,8 +2149,8 @@ mod tests {
             game.apply_action(
                 player,
                 Action::BankTrade {
-                    give: Resource::Brick,
-                    receive: Resource::Brick,
+                    give: Resources::zero(),
+                    receive: Resources::zero(),
                 }
             )
             .unwrap_err(),
@@ -2248,10 +2236,11 @@ mod tests {
             .push(DevelopmentCard::VictoryPoint);
         game.played_dev_card_this_turn = true;
         game.pending_trade = Some(TradeOffer {
+            trade_id: 0,
             from: first,
-            to: other_player(&game, first),
             give: Resources::zero(),
             receive: Resources::zero(),
+            rejected_by: Vec::new(),
         });
 
         game.apply_action(first, Action::EndTurn).unwrap();
@@ -2518,7 +2507,6 @@ mod tests {
         game.apply_action(
             p2,
             Action::OfferTrade {
-                to: p1,
                 give: Resources {
                     ore: 1,
                     ..Default::default()

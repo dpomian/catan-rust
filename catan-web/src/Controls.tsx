@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import type { Action, GameView, PlayerView, Resource, Resources } from './types';
+import { useEffect, useRef, useState } from 'react';
+import type { Action, GameView, PlayerView, Resource, Resources, TradeOffer } from './types';
 import {
   canAfford,
   CITY_COST,
@@ -20,8 +20,7 @@ export type Pending =
   | { kind: 'robber'; tile?: number; target?: number | null }
   | { kind: 'knight'; tile?: number; target?: number | null }
   | { kind: 'roadBuilding'; edges: number[] }
-  | { kind: 'invention'; r1?: Resource; r2?: Resource | null }
-  | { kind: 'tradePlayer'; to?: number; give: Resource; receive: Resource };
+  | { kind: 'invention'; r1?: Resource; r2?: Resource | null };
 
 const RESOURCES: Resource[] = ['Brick', 'Lumber', 'Ore', 'Grain', 'Wool'];
 
@@ -32,16 +31,6 @@ const RESOURCE_COLORS: Record<Resource, string> = {
   Grain: '#f2c96d',
   Wool: '#7fa8d6',
 };
-
-function amountOf(resource: Resource, n: number): Resources {
-  return {
-    brick: resource === 'Brick' ? n : 0,
-    lumber: resource === 'Lumber' ? n : 0,
-    ore: resource === 'Ore' ? n : 0,
-    grain: resource === 'Grain' ? n : 0,
-    wool: resource === 'Wool' ? n : 0,
-  };
-}
 
 export function Controls({ game, me, send, setPending, pending }: ControlsProps) {
   const isMyTurn = game.current_player === me.id && game.winner === null;
@@ -54,22 +43,22 @@ export function Controls({ game, me, send, setPending, pending }: ControlsProps)
   const canBuyDev = turnPhase === 'Main' && isMyTurn && canAfford(me.my_resources, DEV_CARD_COST);
 
   const [monopolyResource, setMonopolyResource] = useState<Resource>('Brick');
+  const [tradeOpen, setTradeOpen] = useState(false);
 
   return (
     <div className="controls">
-      {game.winner !== null && <div className="winner">Winner: {game.players[game.winner]?.name}!</div>}
-
-      {game.pending_trade && game.pending_trade.to === me.id && (
-        <div className="card">
-          <h4>Trade offer from {game.players[game.pending_trade.from]?.name}</h4>
-          <div>
-            Give: {fmtResources(game.pending_trade.give)} &rarr; Receive: {fmtResources(game.pending_trade.receive)}
-          </div>
-          <div className="actions">
-            <button onClick={() => send({ RespondTrade: { accept: true } })}>Accept</button>
-            <button onClick={() => send({ RespondTrade: { accept: false } })}>Reject</button>
+      {tradeOpen && canTrade && (
+        <div className="modal-overlay" onClick={() => setTradeOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <TradePanel game={game} me={me} send={send} onClose={() => setTradeOpen(false)} />
           </div>
         </div>
+      )}
+
+      {game.winner !== null && <div className="winner">Winner: {game.players[game.winner]?.name}!</div>}
+
+      {game.pending_trade && (
+        <TradeOfferCard offer={game.pending_trade} players={game.players} me={me} send={send} />
       )}
 
       {setupPhase && isMyTurn && setupPhase.awaiting_road_for === null && (
@@ -102,6 +91,19 @@ export function Controls({ game, me, send, setPending, pending }: ControlsProps)
       )}
       {pending?.kind === 'invention' && <InventionPicker send={send} setPending={setPending} />}
 
+      <div className="card resource-hand-card">
+        <h4>Resources</h4>
+        <ResourceCards resources={me.my_resources} />
+      </div>
+
+      <div className="card dev-hand-card">
+        <h4>Development Cards</h4>
+        {me.my_hand && me.my_hand.length > 0 ? me.my_hand.join(', ') : 'none'}
+        {me.my_new_cards && me.my_new_cards.length > 0 && (
+          <span> (new: {me.my_new_cards.join(', ')})</span>
+        )}
+      </div>
+
       {canPlayDev && (
         <div className="card dev-card-panel">
           <h4>Development Cards</h4>
@@ -128,22 +130,13 @@ export function Controls({ game, me, send, setPending, pending }: ControlsProps)
         </div>
       )}
 
-      {canTrade && <TradePanel game={game} me={me} send={send} />}
+      {canTrade && (
+        <div className="actions">
+          <button onClick={() => setTradeOpen(true)}>Trade</button>
+        </div>
+      )}
 
       <BuildCostsCard />
-
-      <div className="card resource-hand-card">
-        <h4>Resources</h4>
-        <ResourceCards resources={me.my_resources} />
-      </div>
-
-      <div className="card dev-hand-card">
-        <h4>Development Cards</h4>
-        {me.my_hand && me.my_hand.length > 0 ? me.my_hand.join(', ') : 'none'}
-        {me.my_new_cards && me.my_new_cards.length > 0 && (
-          <span> (new: {me.my_new_cards.join(', ')})</span>
-        )}
-      </div>
 
       {turnPhase === 'Main' && isMyTurn && (
         <div className="actions end-turn-row">
@@ -154,17 +147,127 @@ export function Controls({ game, me, send, setPending, pending }: ControlsProps)
   );
 }
 
-function TradePanel({ game, me, send }: { game: GameView; me: PlayerView; send: (action: Action) => void }) {
-  const [mode, setMode] = useState<'bank' | 'player'>('bank');
-  const [give, setGive] = useState<Resource>('Brick');
-  const [receive, setReceive] = useState<Resource>('Lumber');
-  const [to, setTo] = useState<number>(game.players.find((p) => p.id !== me.id)?.id ?? 0);
+const EMPTY_RESOURCES: Resources = { brick: 0, lumber: 0, ore: 0, grain: 0, wool: 0 };
 
-  const others = game.players.filter((p) => p.id !== me.id);
+const RESOURCE_KEYS: Record<Resource, keyof Resources> = {
+  Brick: 'brick',
+  Lumber: 'lumber',
+  Ore: 'ore',
+  Grain: 'grain',
+  Wool: 'wool',
+};
+
+function totalResources(r: Resources): number {
+  return r.brick + r.lumber + r.ore + r.grain + r.wool;
+}
+
+function resourceEntries(r: Resources): { resource: Resource; count: number }[] {
+  return RESOURCES.map((resource) => ({ resource, count: r[RESOURCE_KEYS[resource]] })).filter(
+    (e) => e.count > 0
+  );
+}
+
+function formatResources(r: Resources): string {
+  const entries = resourceEntries(r);
+  return entries.length > 0
+    ? entries.map((e) => `${e.count} ${e.resource}`).join(', ')
+    : 'nothing';
+}
+
+function TradePanel({
+  game,
+  me,
+  send,
+  onClose,
+}: {
+  game: GameView;
+  me: PlayerView;
+  send: (action: Action) => void;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = useState<'bank' | 'player'>('bank');
+  const [give, setGive] = useState<Resources>({ ...EMPTY_RESOURCES });
+  const [receive, setReceive] = useState<Resources>({ ...EMPTY_RESOURCES });
+  const [offerSubmitted, setOfferSubmitted] = useState(false);
+
+  const pendingOffer =
+    game.pending_trade && game.pending_trade.from === me.id ? game.pending_trade : null;
+  const offerConfirmedRef = useRef(false);
+
+  useEffect(() => {
+    if (pendingOffer) {
+      offerConfirmedRef.current = true;
+    } else if (offerSubmitted && offerConfirmedRef.current) {
+      onClose();
+    }
+  }, [pendingOffer, offerSubmitted, onClose]);
+
+  const canSubmit =
+    totalResources(give) > 0 &&
+    totalResources(receive) > 0 &&
+    canAfford(me.my_resources, give);
+
+  const submit = () => {
+    if (!canSubmit) return;
+    if (mode === 'bank') {
+      send({ BankTrade: { give, receive } });
+      setGive({ ...EMPTY_RESOURCES });
+      setReceive({ ...EMPTY_RESOURCES });
+      onClose();
+    } else {
+      send({ OfferTrade: { give, receive } });
+      setOfferSubmitted(true);
+    }
+  };
+
+  const cancel = () => {
+    if (pendingOffer) {
+      send({ CancelTrade: { trade_id: pendingOffer.trade_id } });
+    }
+    onClose();
+  };
+
+  if (offerSubmitted && pendingOffer) {
+    return (
+      <div className="card trade-panel">
+        <div className="trade-panel-header">
+          <h4>Trade Offer Pending</h4>
+          <button className="trade-close" onClick={cancel}>
+            ×
+          </button>
+        </div>
+        <p className="trade-offer-text">
+          You offer {formatResources(pendingOffer.give)} in exchange for{' '}
+          {formatResources(pendingOffer.receive)}.
+        </p>
+        <p className="trade-hint">This offer will expire in 15 seconds unless someone accepts it.</p>
+        <div className="actions">
+          <button onClick={cancel}>Cancel Offer</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (offerSubmitted && !pendingOffer) {
+    return (
+      <div className="card trade-panel">
+        <div className="trade-panel-header">
+          <h4>Trade</h4>
+          <button className="trade-close" onClick={onClose}>
+            ×
+          </button>
+        </div>
+        <p className="trade-hint">Sending offer...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="card trade-panel">
-      <h4>Trade</h4>
+      <div className="trade-panel-header">
+        <h4>Trade</h4>
+        <button className="trade-close" onClick={onClose}>×</button>
+      </div>
       <div className="trade-tabs">
         <button className={mode === 'bank' ? 'active' : ''} onClick={() => setMode('bank')}>
           Bank
@@ -173,48 +276,94 @@ function TradePanel({ game, me, send }: { game: GameView; me: PlayerView; send: 
           Player
         </button>
       </div>
-      <div className="trade-fields">
-        {mode === 'player' && (
-          <select value={to} onChange={(e) => setTo(parseInt(e.target.value))}>
-            {others.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </select>
-        )}
-        <span>give</span>
-        <select value={give} onChange={(e) => setGive(e.target.value as Resource)}>
-          {RESOURCES.map((r) => (
-            <option key={r} value={r}>
-              {r}
-            </option>
-          ))}
-        </select>
-        <span>for</span>
-        <select value={receive} onChange={(e) => setReceive(e.target.value as Resource)}>
-          {RESOURCES.map((r) => (
-            <option key={r} value={r}>
-              {r}
-            </option>
-          ))}
-        </select>
-        <button
-          onClick={() =>
-            mode === 'bank'
-              ? send({ BankTrade: { give, receive } })
-              : send({
-                  OfferTrade: {
-                    to,
-                    give: amountOf(give, 1),
-                    receive: amountOf(receive, 1),
-                  },
-                })
-          }
-        >
-          {mode === 'bank' ? 'Trade' : 'Offer'}
+      <div className="trade-bundles">
+        <ResourceBundleEditor label="You give" resources={give} maxResources={me.my_resources} onChange={setGive} />
+        <div className="trade-exchange-arrow">&darr; in exchange for &darr;</div>
+        <ResourceBundleEditor label="You receive" resources={receive} onChange={setReceive} />
+        <button className="trade-submit" onClick={submit} disabled={!canSubmit}>
+          {mode === 'bank' ? 'Trade with Bank' : 'Offer to Players'}
         </button>
+        {mode === 'bank' && (
+          <p className="trade-hint">The bank will always accept as long as you can pay.</p>
+        )}
       </div>
+    </div>
+  );
+}
+
+function ResourceBundleEditor({
+  label,
+  resources,
+  maxResources,
+  onChange,
+}: {
+  label: string;
+  resources: Resources;
+  maxResources?: Resources | null;
+  onChange: (resources: Resources) => void;
+}) {
+  return (
+    <div className="trade-bundle-editor">
+      <div className="trade-bundle-label">{label}</div>
+      <div className="trade-resource-rows">
+        {RESOURCES.map((resource) => {
+          const key = RESOURCE_KEYS[resource];
+          const count = resources[key];
+          const max = maxResources ? maxResources[key] : undefined;
+          return (
+            <label key={resource} className="trade-resource-row">
+              <span className="trade-resource-name">{resource}</span>
+              <input
+                type="number"
+                min={0}
+                max={max ?? 99}
+                value={count}
+                onChange={(e) => {
+                  let value = parseInt(e.target.value, 10);
+                  if (Number.isNaN(value)) value = 0;
+                  value = Math.max(0, value);
+                  if (max !== undefined) value = Math.min(value, max);
+                  onChange({ ...resources, [key]: value });
+                }}
+              />
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TradeOfferCard({
+  offer,
+  players,
+  me,
+  send,
+}: {
+  offer: TradeOffer;
+  players: PlayerView[];
+  me: PlayerView;
+  send: (action: Action) => void;
+}) {
+  const from = players.find((p) => p.id === offer.from);
+  const isInitiator = me.id === offer.from;
+
+  if (!isInitiator && offer.rejected_by.includes(me.id)) {
+    return null;
+  }
+
+  const offerText = `${isInitiator ? 'You' : from?.name ?? 'Unknown'} offers ${formatResources(offer.give)} in exchange for ${formatResources(offer.receive)}`;
+
+  return (
+    <div className="card trade-offer-card">
+      <h4>Trade Offer</h4>
+      <p className="trade-offer-text">{offerText}</p>
+      {!isInitiator && (
+        <div className="actions">
+          <button onClick={() => send({ RespondTrade: { accept: true } })}>Accept</button>
+          <button onClick={() => send({ RespondTrade: { accept: false } })}>Reject</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -344,13 +493,4 @@ function InventionPicker({ send, setPending }: { send: (a: Action) => void; setP
   );
 }
 
-function fmtResources(r: Resources): string {
-  const map: Record<Resource, keyof Resources> = {
-    Brick: 'brick',
-    Lumber: 'lumber',
-    Ore: 'ore',
-    Grain: 'grain',
-    Wool: 'wool',
-  };
-  return RESOURCES.map((res) => `${res}: ${r[map[res]]}`).join(', ');
-}
+

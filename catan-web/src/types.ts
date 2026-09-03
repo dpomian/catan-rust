@@ -71,10 +71,11 @@ export interface PlayerView {
 }
 
 export interface TradeOffer {
+  trade_id: number;
   from: number;
-  to: number;
   give: Resources;
   receive: Resources;
+  rejected_by: number[];
 }
 
 export interface GameView {
@@ -123,7 +124,8 @@ export type Action =
   | { PlayRoadBuilding: [number, number] }
   | { PlayInvention: [Resource, Resource] }
   | { PlayMonopoly: Resource }
-  | { OfferTrade: { to: number; give: Resources; receive: Resources } }
+  | { OfferTrade: { give: Resources; receive: Resources } }
   | { RespondTrade: { accept: boolean } }
-  | { BankTrade: { give: Resource; receive: Resource } }
+  | { CancelTrade: { trade_id: number } }
+  | { BankTrade: { give: Resources; receive: Resources } }
   | 'EndTurn';

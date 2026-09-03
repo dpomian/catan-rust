@@ -187,6 +187,20 @@ impl Resources {
         self.set(resource, self.get(resource).saturating_sub(amount));
     }
 
+    /// Add every resource from `other` to this bundle, capping each at `u8::MAX`.
+    pub fn add_resources(&mut self, other: &Resources) {
+        for r in Resource::all() {
+            self.add(r, other.get(r));
+        }
+    }
+
+    /// Subtract every resource in `other` from this bundle, saturating at zero.
+    pub fn sub_resources(&mut self, other: &Resources) {
+        for r in Resource::all() {
+            self.sub(r, other.get(r));
+        }
+    }
+
     /// Check whether this bundle covers the cost in every resource.
     pub fn can_afford(&self, cost: &Resources) -> bool {
         self.brick >= cost.brick
@@ -213,10 +227,11 @@ pub enum Building {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradeOffer {
+    pub trade_id: u64,
     pub from: PlayerId,
-    pub to: PlayerId,
     pub give: Resources,
     pub receive: Resources,
+    pub rejected_by: Vec<PlayerId>,
 }
 
 #[cfg(test)]
