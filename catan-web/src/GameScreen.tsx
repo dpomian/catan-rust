@@ -116,14 +116,16 @@ export function GameScreen({ game, send, pending, setPending, robberTile, setRob
   let edgeHighlight = new Set<number>();
   let tileHighlight = new Set<number>();
 
-  if (setupPhase && setupPhase.awaiting_road_for === null) {
-    vertexHighlight = validSetupSettlements;
-  } else if (setupPhase && setupPhase.awaiting_road_for !== null) {
-    edgeHighlight = validSetupRoads;
-  } else if (turnPhase === 'Main') {
-    vertexHighlight = new Set([...validSettlements, ...validCities]);
-    if (!pending || pending.kind === 'roadBuilding') {
-      edgeHighlight = validRoads;
+  if (game.current_player === me.id) {
+    if (setupPhase && setupPhase.awaiting_road_for === null) {
+      vertexHighlight = validSetupSettlements;
+    } else if (setupPhase && setupPhase.awaiting_road_for !== null) {
+      edgeHighlight = validSetupRoads;
+    } else if (turnPhase === 'Main') {
+      vertexHighlight = new Set([...validSettlements, ...validCities]);
+      if (!pending || pending.kind === 'roadBuilding') {
+        edgeHighlight = validRoads;
+      }
     }
   }
 

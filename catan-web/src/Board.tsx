@@ -1,4 +1,7 @@
+import { useMemo } from 'react';
 import type { Board, Edge, PlayerColor, Port, Resource, Terrain, Tile, Vertex } from './types';
+
+const VIEWBOX_PAD = 0.6;
 
 interface BoardProps {
   board: Board;
@@ -27,9 +30,27 @@ export function Board({
   highlightEdges,
   selectedEdges,
 }: BoardProps) {
+  const viewBox = useMemo(() => {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const v of board.vertices) {
+      const { x, y } = v.position;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    if (!Number.isFinite(minX)) return '-4 -4 8 8';
+    const width = maxX - minX + 2 * VIEWBOX_PAD;
+    const height = maxY - minY + 2 * VIEWBOX_PAD;
+    return `${minX - VIEWBOX_PAD} ${minY - VIEWBOX_PAD} ${width} ${height}`;
+  }, [board.vertices]);
+
   return (
     <svg
-      viewBox="-4 -4 8 8"
+      viewBox={viewBox}
       style={{ width: '100%', height: '100%', maxHeight: '80vh', display: 'block' }}
       preserveAspectRatio="xMidYMid meet"
     >
@@ -42,24 +63,30 @@ export function Board({
           highlight={highlightTiles?.has(tile.id) ?? false}
         />
       ))}
-      {board.edges.map((edge) => (
-        <EdgeShape
-          key={edge.id}
-          edge={edge}
-          vertices={board.vertices}
-          onClick={selectableEdges ? onEdgeClick : undefined}
-          highlight={highlightEdges?.has(edge.id) ?? false}
-          selected={selectedEdges?.has(edge.id) ?? false}
-        />
-      ))}
-      {board.vertices.map((vertex) => (
-        <VertexShape
-          key={vertex.id}
-          vertex={vertex}
-          onClick={selectableVertices ? onVertexClick : undefined}
-          highlight={highlightVertices?.has(vertex.id) ?? false}
-        />
-      ))}
+      {board.edges.map((edge) => {
+        const highlight = highlightEdges?.has(edge.id) ?? false;
+        return (
+          <EdgeShape
+            key={edge.id}
+            edge={edge}
+            vertices={board.vertices}
+            onClick={selectableEdges && highlight ? onEdgeClick : undefined}
+            highlight={highlight}
+            selected={selectedEdges?.has(edge.id) ?? false}
+          />
+        );
+      })}
+      {board.vertices.map((vertex) => {
+        const highlight = highlightVertices?.has(vertex.id) ?? false;
+        return (
+          <VertexShape
+            key={vertex.id}
+            vertex={vertex}
+            onClick={selectableVertices && highlight ? onVertexClick : undefined}
+            highlight={highlight}
+          />
+        );
+      })}
     </svg>
   );
 }

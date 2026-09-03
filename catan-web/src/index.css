@@ -332,15 +332,15 @@ header {
   opacity: 0.7;
 }
 
-.edge-clickable:hover .edge-base {
+.edge-highlight .edge-base {
   stroke: #666666;
+  stroke-width: 0.08;
+  stroke-dasharray: 0.1 0.05;
   opacity: 1;
 }
 
-.edge-highlight .edge-base {
+.edge-clickable:hover .edge-base {
   stroke: #1976d2;
-  stroke-width: 0.08;
-  stroke-dasharray: 0.1 0.05;
   opacity: 1;
 }
 
