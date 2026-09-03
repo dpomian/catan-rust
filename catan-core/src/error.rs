@@ -21,8 +21,12 @@ pub enum CatanError {
     MustRollDice,
     #[error("Robber must be moved")]
     MustMoveRobber,
+    #[error("Required resources must be discarded first")]
+    MustDiscard,
     #[error("Invalid robber location")]
     InvalidRobberLocation,
+    #[error("Invalid robber target")]
+    InvalidRobberTarget,
     #[error("Invalid trade")]
     InvalidTrade,
     #[error("No pending trade")]

@@ -35,6 +35,7 @@ pub enum Action {
         tile: TileId,
         target: Option<PlayerId>,
     },
+    Discard(Resources),
     BuildRoad(EdgeId),
     BuildSettlement(VertexId),
     BuildCity(VertexId),
@@ -44,7 +45,7 @@ pub enum Action {
         target: Option<PlayerId>,
     },
     PlayRoadBuilding(EdgeId, EdgeId),
-    PlayInvention(Resource, Option<Resource>),
+    PlayInvention(Resource, Resource),
     PlayMonopoly(Resource),
     OfferTrade {
         to: PlayerId,
@@ -72,6 +73,7 @@ pub struct Game {
     pub longest_road: Option<PlayerId>,
     pub largest_army: Option<PlayerId>,
     pub pending_trade: Option<TradeOffer>,
+    pub pending_discards: HashMap<PlayerId, u16>,
     pub development_deck: Vec<DevelopmentCard>,
     pub winner: Option<PlayerId>,
     pub played_dev_card_this_turn: bool,
@@ -82,7 +84,7 @@ pub struct PlayerView {
     pub id: PlayerId,
     pub name: String,
     pub color: PlayerColor,
-    pub resource_count: u8,
+    pub resource_count: u16,
     pub dev_card_count: u8,
     pub victory_points: u8,
     pub played_knights: u8,
@@ -107,6 +109,7 @@ pub struct GameView {
     pub longest_road: Option<PlayerId>,
     pub largest_army: Option<PlayerId>,
     pub pending_trade: Option<TradeOffer>,
+    pub pending_discards: HashMap<PlayerId, u16>,
     pub winner: Option<PlayerId>,
 }
 
@@ -123,7 +126,7 @@ impl Game {
                     + self.longest_road_points(p.id)
                     + self.largest_army_points(p.id);
                 let vps = if is_me {
-                    public_vps + p.victory_point_cards
+                    public_vps + p.victory_point_cards + p.hidden_victory_points()
                 } else {
                     public_vps
                 };
@@ -165,13 +168,20 @@ impl Game {
             longest_road: self.longest_road,
             largest_army: self.largest_army,
             pending_trade: self.pending_trade.clone(),
+            pending_discards: self.pending_discards.clone(),
             winner: self.winner,
         }
     }
 
     /// Create a new game with a randomized board, turn order, and shuffled dev-card deck.
     pub fn new(players: Vec<Player>) -> Result<Self, CatanError> {
-        if players.len() < 2 || players.len() > 4 {
+        if players.len() < 2
+            || players.len() > 4
+            || players
+                .iter()
+                .enumerate()
+                .any(|(index, player)| player.id != index)
+        {
             return Err(CatanError::InvalidPlayer);
         }
 
@@ -197,6 +207,7 @@ impl Game {
             longest_road: None,
             largest_army: None,
             pending_trade: None,
+            pending_discards: HashMap::new(),
             development_deck: deck,
             winner: None,
             played_dev_card_this_turn: false,
@@ -278,13 +289,21 @@ impl Game {
         player: PlayerId,
         vertex_id: VertexId,
     ) -> Result<(), CatanError> {
-        let vertex = &self.board.vertices[vertex_id];
+        let vertex = self
+            .board
+            .vertices
+            .get(vertex_id)
+            .ok_or(CatanError::InvalidBuildLocation)?;
         if vertex.building.is_some() {
             return Err(CatanError::InvalidBuildLocation);
         }
 
         // Distance rule: no adjacent building.
-        for &adj in &self.board.adjacent_vertices(vertex_id) {
+        for adj in self
+            .board
+            .adjacent_vertices(vertex_id)
+            .ok_or(CatanError::InvalidBuildLocation)?
+        {
             if self.board.vertices[adj].building.is_some() {
                 return Err(CatanError::InvalidBuildLocation);
             }
@@ -305,7 +324,11 @@ impl Game {
         edge_id: EdgeId,
         settlement: VertexId,
     ) -> Result<(), CatanError> {
-        let edge = &self.board.edges[edge_id];
+        let edge = self
+            .board
+            .edges
+            .get(edge_id)
+            .ok_or(CatanError::InvalidBuildLocation)?;
         if edge.road.is_some() {
             return Err(CatanError::InvalidBuildLocation);
         }
@@ -361,6 +384,12 @@ impl Game {
         turn_phase: TurnPhase,
         action: Action,
     ) -> Result<(), CatanError> {
+        if turn_phase == TurnPhase::ResolveSeven
+            && let Action::Discard(resources) = action
+        {
+            return self.discard_resources(player, resources);
+        }
+
         if player != self.current_player() {
             // Only trade responses are allowed out of turn.
             if let Action::RespondTrade { accept } = action {
@@ -375,6 +404,9 @@ impl Game {
                 self.play_knight(player, tile, target)
             }
             (TurnPhase::ResolveSeven, Action::MoveRobber { tile, target }) => {
+                if !self.pending_discards.is_empty() {
+                    return Err(CatanError::MustDiscard);
+                }
                 self.move_robber(player, tile, target)?;
                 self.phase = GamePhase::Turn(TurnPhase::Main);
                 Ok(())
@@ -428,41 +460,35 @@ impl Game {
         Ok(())
     }
 
-    /// Discard half of each player's hand (rounded down) when a 7 is rolled.
+    /// Record how many resources each player must discard after a 7.
     fn discard_over_7(&mut self) {
-        // In a real game each player over 7 cards discards half. In this synchronous
-        // implementation we discard half automatically (rounded down).
-        let to_discard: Vec<(PlayerId, u8)> = self
+        self.pending_discards = self
             .players
             .iter()
-            .map(|p| (p.id, p.resources.total()))
-            .filter(|(_, total)| *total > 7)
-            .map(|(id, total)| (id, total / 2))
+            .filter_map(|p| {
+                let total = p.resources.total();
+                (total > 7).then_some((p.id, total / 2))
+            })
             .collect();
-        for (id, amount) in to_discard {
-            self.discard_random(id, amount);
-        }
     }
 
-    /// Deterministically discard one resource at a time across available types.
-    fn discard_random(&mut self, player: PlayerId, mut amount: u8) {
-        let p = &mut self.players[player];
-        let all_resources: Vec<Resource> = Resource::all()
-            .iter()
-            .filter(|&&r| p.resources.get(r) > 0)
+    fn discard_resources(
+        &mut self,
+        player: PlayerId,
+        resources: Resources,
+    ) -> Result<(), CatanError> {
+        let required = self
+            .pending_discards
+            .get(&player)
             .copied()
-            .collect();
-
-        // Naive deterministic discard: remove one from each resource in turn.
-        let mut idx = 0;
-        while amount > 0 {
-            let resource = all_resources[idx % all_resources.len()];
-            if p.resources.get(resource) > 0 {
-                p.resources.sub(resource, 1);
-                amount -= 1;
-            }
-            idx += 1;
+            .ok_or(CatanError::InvalidPhase)?;
+        if resources.total() != required || !self.players[player].resources.can_afford(&resources) {
+            return Err(CatanError::MustDiscard);
         }
+
+        self.pay_cost(player, &resources);
+        self.pending_discards.remove(&player);
+        Ok(())
     }
 
     /// Distribute resources to settlements and cities touching the rolled number.
@@ -501,25 +527,28 @@ impl Game {
             return Err(CatanError::InvalidRobberLocation);
         }
 
-        let mut stolen: Option<(PlayerId, Resource)> = None;
-        if let Some(target_id) = target {
-            let victims: Vec<PlayerId> = self.board.tiles[tile_id]
-                .vertices
-                .iter()
-                .filter_map(|&v| match self.board.vertices[v].building {
-                    Some(Building::Settlement(pid) | Building::City(pid)) => Some(pid),
-                    _ => None,
-                })
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            if victims.contains(&target_id) && target_id != player {
-                if let Some(resource) = self.steal_random_card(target_id) {
-                    stolen = Some((target_id, resource));
+        let victims: HashSet<PlayerId> = self.board.tiles[tile_id]
+            .vertices
+            .iter()
+            .filter_map(|&v| match self.board.vertices[v].building {
+                Some(Building::Settlement(pid) | Building::City(pid))
+                    if pid != player && self.players[pid].resources.total() > 0 =>
+                {
+                    Some(pid)
                 }
-            }
+                _ => None,
+            })
+            .collect();
+        if target.map_or(!victims.is_empty(), |target_id| {
+            !victims.contains(&target_id)
+        }) {
+            return Err(CatanError::InvalidRobberTarget);
         }
+
+        let stolen = target.and_then(|target_id| {
+            self.steal_random_card(target_id)
+                .map(|resource| (target_id, resource))
+        });
 
         if let Some(t) = self.board.tiles.iter_mut().find(|t| t.has_robber) {
             t.has_robber = false;
@@ -549,6 +578,9 @@ impl Game {
         if !self.can_build_road(player, edge_id) {
             return Err(CatanError::InvalidBuildLocation);
         }
+        if self.players[player].remaining_roads == 0 {
+            return Err(CatanError::NoPiecesRemaining);
+        }
 
         let cost = road_cost();
         if !self.players[player].resources.can_afford(&cost) {
@@ -564,19 +596,18 @@ impl Game {
     /// A road is buildable if the edge is free, endpoints are not blocked by opponents,
     /// and it reaches the player's road network.
     fn can_build_road(&self, player: PlayerId, edge_id: EdgeId) -> bool {
-        let edge = &self.board.edges[edge_id];
+        let Some(edge) = self.board.edges.get(edge_id) else {
+            return false;
+        };
         if edge.road.is_some() {
             return false;
         }
 
         let a = edge.endpoints[0];
         let b = edge.endpoints[1];
-        if self.is_blocked_vertex(a, player) || self.is_blocked_vertex(b, player) {
-            return false;
-        }
-
         let reachable = self.reachable_vertices(player);
-        reachable.contains(&a) || reachable.contains(&b)
+        (!self.is_blocked_vertex(a, player) && reachable.contains(&a))
+            || (!self.is_blocked_vertex(b, player) && reachable.contains(&b))
     }
 
     /// Flood-fill the player's road network, stopping at opponent settlements/cities.
@@ -596,12 +627,12 @@ impl Game {
 
         while let Some(v) = queue.pop() {
             for &edge_id in &self.board.vertices[v].incident_edges {
-                if self.board.edges[edge_id].road == Some(player) {
-                    if let Some(other) = self.board.edges[edge_id].other_vertex(v) {
-                        if !self.is_blocked_vertex(other, player) && visited.insert(other) {
-                            queue.push(other);
-                        }
-                    }
+                if self.board.edges[edge_id].road == Some(player)
+                    && let Some(other) = self.board.edges[edge_id].other_vertex(v)
+                    && !self.is_blocked_vertex(other, player)
+                    && visited.insert(other)
+                {
+                    queue.push(other);
                 }
             }
         }
@@ -615,11 +646,22 @@ impl Game {
         player: PlayerId,
         vertex_id: VertexId,
     ) -> Result<(), CatanError> {
-        if self.board.vertices[vertex_id].building.is_some() {
+        if self
+            .board
+            .vertices
+            .get(vertex_id)
+            .ok_or(CatanError::InvalidBuildLocation)?
+            .building
+            .is_some()
+        {
             return Err(CatanError::InvalidBuildLocation);
         }
 
-        for &adj in &self.board.adjacent_vertices(vertex_id) {
+        for adj in self
+            .board
+            .adjacent_vertices(vertex_id)
+            .ok_or(CatanError::InvalidBuildLocation)?
+        {
             if self.board.vertices[adj].building.is_some() {
                 return Err(CatanError::InvalidBuildLocation);
             }
@@ -653,7 +695,12 @@ impl Game {
         player: PlayerId,
         vertex_id: VertexId,
     ) -> Result<(), CatanError> {
-        match self.board.vertices[vertex_id].building {
+        match self
+            .board
+            .vertices
+            .get(vertex_id)
+            .and_then(|vertex| vertex.building)
+        {
             Some(Building::Settlement(pid)) if pid == player => {}
             _ => return Err(CatanError::InvalidBuildLocation),
         }
@@ -703,13 +750,12 @@ impl Game {
         target: Option<PlayerId>,
     ) -> Result<(), CatanError> {
         self.validate_play_dev_card(player, DevelopmentCard::Knight)?;
+        self.move_robber(player, tile_id, target)?;
         self.players[player].remove_card(DevelopmentCard::Knight);
         self.players[player].played_knights += 1;
         self.played_dev_card_this_turn = true;
         self.recalculate_largest_army();
-
-        // Move the robber. Treat the play as a robber resolution.
-        self.move_robber(player, tile_id, target)
+        Ok(())
     }
 
     /// Play Road Building to place two free roads, rolling back the first if the second fails.
@@ -742,22 +788,16 @@ impl Game {
         Ok(())
     }
 
-    /// Play an Invention (Year of Plenty) card to gain one or two resources.
+    /// Play an Invention (Year of Plenty) card to gain two resources.
     fn play_invention(
         &mut self,
         player: PlayerId,
         r1: Resource,
-        r2: Option<Resource>,
+        r2: Resource,
     ) -> Result<(), CatanError> {
         self.validate_play_dev_card(player, DevelopmentCard::Invention)?;
         self.players[player].resources.add(r1, 1);
-        if let Some(r) = r2 {
-            if r != r1 {
-                self.players[player].resources.add(r, 1);
-            } else {
-                self.players[player].resources.add(r1, 1);
-            }
-        }
+        self.players[player].resources.add(r2, 1);
         self.players[player].remove_card(DevelopmentCard::Invention);
         self.played_dev_card_this_turn = true;
         Ok(())
@@ -766,16 +806,18 @@ impl Game {
     /// Play a Monopoly card to take all of one resource from opponents.
     fn play_monopoly(&mut self, player: PlayerId, resource: Resource) -> Result<(), CatanError> {
         self.validate_play_dev_card(player, DevelopmentCard::Monopoly)?;
-        let mut total = 0u8;
+        let mut total = 0u16;
         for pid in 0..self.players.len() {
             if pid == player {
                 continue;
             }
             let amount = self.players[pid].resources.get(resource);
             self.players[pid].resources.sub(resource, amount);
-            total += amount;
+            total += u16::from(amount);
         }
-        self.players[player].resources.add(resource, total);
+        self.players[player]
+            .resources
+            .add(resource, total.min(u16::from(u8::MAX)) as u8);
         self.players[player].remove_card(DevelopmentCard::Monopoly);
         self.played_dev_card_this_turn = true;
         Ok(())
@@ -995,7 +1037,7 @@ impl Game {
     pub fn check_winner(&mut self) {
         for &player_id in &self.player_order {
             let p = &self.players[player_id];
-            let mut vps = p.public_victory_points();
+            let mut vps = p.public_victory_points() + p.hidden_victory_points();
             vps += self.settlement_city_points(player_id);
             vps += self.longest_road_points(player_id);
             vps += self.largest_army_points(player_id);
@@ -1053,34 +1095,58 @@ impl Game {
 
     /// Award largest army to the player with the most played knights (at least 3).
     fn recalculate_largest_army(&mut self) {
-        let mut best: Option<(PlayerId, u8)> = None;
-        for &pid in &self.player_order {
-            let knights = self.players[pid].played_knights;
-            if knights >= 3 {
-                if best.map_or(true, |(_, k)| knights > k) {
-                    best = Some((pid, knights));
-                }
-            }
+        let max_knights = self
+            .players
+            .iter()
+            .map(|player| player.played_knights)
+            .max()
+            .unwrap_or(0);
+        if max_knights < 3 {
+            self.largest_army = None;
+            return;
         }
-        if let Some((pid, _)) = best {
-            self.largest_army = Some(pid);
+        if self
+            .largest_army
+            .is_some_and(|holder| self.players[holder].played_knights == max_knights)
+        {
+            return;
         }
+
+        let leaders: Vec<PlayerId> = self
+            .players
+            .iter()
+            .filter(|player| player.played_knights == max_knights)
+            .map(|player| player.id)
+            .collect();
+        self.largest_army = (leaders.len() == 1).then_some(leaders[0]);
     }
 
     /// Award longest road to the player with the longest road (at least 5).
     fn recalculate_longest_road(&mut self) {
-        let mut best: Option<(PlayerId, usize)> = None;
-        for &pid in &self.player_order {
-            let length = self.longest_road_for_player(pid);
-            if length >= 5 {
-                if best.map_or(true, |(_, l)| length > l) {
-                    best = Some((pid, length));
-                }
-            }
+        let lengths: Vec<(PlayerId, usize)> = self
+            .players
+            .iter()
+            .map(|player| (player.id, self.longest_road_for_player(player.id)))
+            .collect();
+        let max_length = lengths.iter().map(|(_, length)| *length).max().unwrap_or(0);
+        if max_length < 5 {
+            self.longest_road = None;
+            return;
         }
-        if let Some((pid, _)) = best {
-            self.longest_road = Some(pid);
+        if self.longest_road.is_some_and(|holder| {
+            lengths
+                .iter()
+                .any(|&(player, length)| player == holder && length == max_length)
+        }) {
+            return;
         }
+
+        let leaders: Vec<PlayerId> = lengths
+            .into_iter()
+            .filter(|&(_, length)| length == max_length)
+            .map(|(player, _)| player)
+            .collect();
+        self.longest_road = (leaders.len() == 1).then_some(leaders[0]);
     }
 
     /// Compute the longest contiguous road for a player, treating opponent settlements as dead ends.
@@ -1099,7 +1165,7 @@ impl Game {
 
         // Build a graph of the player's roads. Opponent buildings block the path.
         // Road edges that end at an opponent building are modelled as leaves.
-        let mut adj: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
+        let mut adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
         let mut next_virtual = self.board.vertices.len();
 
         for &edge_id in &player_edges {
@@ -1114,55 +1180,54 @@ impl Game {
             }
 
             if !a_blocked && !b_blocked {
-                adj.entry(a).or_default().push(b);
-                adj.entry(b).or_default().push(a);
+                adj.entry(a).or_default().push((b, edge_id));
+                adj.entry(b).or_default().push((a, edge_id));
             } else if a_blocked {
                 let leaf = next_virtual;
                 next_virtual += 1;
-                adj.entry(b).or_default().push(leaf);
-                adj.entry(leaf).or_default().push(b);
+                adj.entry(b).or_default().push((leaf, edge_id));
+                adj.entry(leaf).or_default().push((b, edge_id));
             } else {
                 let leaf = next_virtual;
                 next_virtual += 1;
-                adj.entry(a).or_default().push(leaf);
-                adj.entry(leaf).or_default().push(a);
+                adj.entry(a).or_default().push((leaf, edge_id));
+                adj.entry(leaf).or_default().push((a, edge_id));
             }
         }
 
         let mut best = 0usize;
         let starts: Vec<VertexId> = adj.keys().copied().collect();
         for start in starts {
-            let mut visited = HashSet::new();
-            best = best.max(self.dfs_longest(start, &adj, &mut visited));
+            let mut used_edges = HashSet::new();
+            best = best.max(self.dfs_longest(start, &adj, &mut used_edges));
         }
         best
     }
 
     /// An opponent settlement or city blocks a vertex for this player.
     fn is_blocked_vertex(&self, vertex: VertexId, player: PlayerId) -> bool {
-        match self.board.vertices[vertex].building {
-            Some(Building::Settlement(pid) | Building::City(pid)) if pid != player => true,
-            _ => false,
-        }
+        matches!(
+            self.board.vertices[vertex].building,
+            Some(Building::Settlement(pid) | Building::City(pid)) if pid != player
+        )
     }
 
-    /// Brute-force search for the longest simple path in the player's road graph.
+    /// Brute-force search for the longest trail in the player's road graph.
     fn dfs_longest(
         &self,
         current: VertexId,
-        adj: &HashMap<VertexId, Vec<VertexId>>,
-        visited: &mut HashSet<VertexId>,
+        adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>,
+        used_edges: &mut HashSet<EdgeId>,
     ) -> usize {
-        visited.insert(current);
         let mut max = 0usize;
         if let Some(neighbors) = adj.get(&current) {
-            for &next in neighbors {
-                if !visited.contains(&next) {
-                    max = max.max(1 + self.dfs_longest(next, adj, visited));
+            for &(next, edge_id) in neighbors {
+                if used_edges.insert(edge_id) {
+                    max = max.max(1 + self.dfs_longest(next, adj, used_edges));
+                    used_edges.remove(&edge_id);
                 }
             }
         }
-        visited.remove(&current);
         max
     }
 }
@@ -1286,7 +1351,8 @@ mod tests {
                 .find(|t| !t.has_robber && t.terrain != Terrain::Desert)
                 .map(|t| t.id)
                 .expect("non-robber tile");
-            game.apply_action(player, Action::MoveRobber { tile, target: None })
+            let target = robber_target(&game, player, tile);
+            game.apply_action(player, Action::MoveRobber { tile, target })
                 .expect("move robber");
         }
 
@@ -1314,7 +1380,7 @@ mod tests {
             let vertex = valid_settlement_vertex(game).expect("valid vertex");
             game.apply_action(player, Action::PlaceSettlement(vertex))
                 .expect("place settlement");
-            let road = valid_edge_for_settlement(&game, vertex);
+            let road = valid_edge_for_settlement(game, vertex);
             game.apply_action(player, Action::PlaceRoad(road))
                 .expect("place road");
         }
@@ -1328,6 +1394,21 @@ mod tests {
             .expect("other player")
     }
 
+    fn robber_target(game: &Game, player: PlayerId, tile: TileId) -> Option<PlayerId> {
+        game.board.tiles[tile]
+            .vertices
+            .iter()
+            .filter_map(|&vertex| match game.board.vertices[vertex].building {
+                Some(Building::Settlement(pid) | Building::City(pid))
+                    if pid != player && game.players[pid].resources.total() > 0 =>
+                {
+                    Some(pid)
+                }
+                _ => None,
+            })
+            .next()
+    }
+
     fn enter_main_phase(game: &mut Game) {
         let player = game.current_player();
         game.apply_action(player, Action::RollDice).expect("roll");
@@ -1339,7 +1420,8 @@ mod tests {
                 .find(|t| !t.has_robber)
                 .map(|t| t.id)
                 .expect("non-robber tile");
-            game.apply_action(player, Action::MoveRobber { tile, target: None })
+            let target = robber_target(game, player, tile);
+            game.apply_action(player, Action::MoveRobber { tile, target })
                 .expect("move robber");
         }
     }
@@ -1432,6 +1514,7 @@ mod tests {
         let adjacent = game
             .board
             .adjacent_vertices(vertex)
+            .unwrap()
             .into_iter()
             .find(|&a| game.board.vertices[a].building.is_none())
             .expect("free adjacent vertex");
@@ -1467,6 +1550,7 @@ mod tests {
                     && game
                         .board
                         .adjacent_vertices(v)
+                        .unwrap()
                         .iter()
                         .all(|&a| game.board.vertices[a].building.is_none())
             }) else {
@@ -1502,6 +1586,7 @@ mod tests {
                     && game
                         .board
                         .adjacent_vertices(v)
+                        .unwrap()
                         .iter()
                         .all(|&a| game.board.vertices[a].building.is_none())
             }) else {
@@ -1589,6 +1674,7 @@ mod tests {
         let adjacent = game
             .board
             .adjacent_vertices(settlement)
+            .unwrap()
             .into_iter()
             .find(|&a| game.board.vertices[a].building.is_none())
             .unwrap();
@@ -1615,6 +1701,7 @@ mod tests {
                     && game
                         .board
                         .adjacent_vertices(v.id)
+                        .unwrap()
                         .iter()
                         .all(|&a| game.board.vertices[a].building.is_none())
             })
@@ -1745,7 +1832,8 @@ mod tests {
             .find(|t| !t.has_robber)
             .map(|t| t.id)
             .expect("non-robber tile");
-        game.apply_action(player, Action::PlayKnight { tile, target: None })
+        let target = robber_target(&game, player, tile);
+        game.apply_action(player, Action::PlayKnight { tile, target })
             .unwrap();
         assert!(game.board.tiles[tile].has_robber);
         assert_eq!(game.players[player].played_knights, 1);
@@ -1769,6 +1857,7 @@ mod tests {
         let v2 = game
             .board
             .adjacent_vertices(settlement)
+            .unwrap()
             .into_iter()
             .find(|&a| game.board.vertices[a].building.is_none())
             .unwrap();
@@ -1792,7 +1881,8 @@ mod tests {
             .find(|t| !t.has_robber)
             .map(|t| t.id)
             .unwrap();
-        game.apply_action(player, Action::PlayKnight { tile, target: None })
+        let target = robber_target(&game, player, tile);
+        game.apply_action(player, Action::PlayKnight { tile, target })
             .unwrap();
 
         assert_eq!(
@@ -1844,7 +1934,7 @@ mod tests {
         game.players[player].hand.push(DevelopmentCard::Invention);
         game.apply_action(
             player,
-            Action::PlayInvention(Resource::Brick, Some(Resource::Lumber)),
+            Action::PlayInvention(Resource::Brick, Resource::Lumber),
         )
         .unwrap();
         assert_eq!(game.players[player].resources.brick, 1);
@@ -1859,11 +1949,8 @@ mod tests {
         let player = game.current_player();
         game.players[player].resources = Resources::zero();
         game.players[player].hand.push(DevelopmentCard::Invention);
-        game.apply_action(
-            player,
-            Action::PlayInvention(Resource::Ore, Some(Resource::Ore)),
-        )
-        .unwrap();
+        game.apply_action(player, Action::PlayInvention(Resource::Ore, Resource::Ore))
+            .unwrap();
         assert_eq!(game.players[player].resources.ore, 2);
     }
 
@@ -2084,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_roll_discards_half() {
+    fn seven_roll_requires_player_to_discard_half() {
         let mut game = Game::new(make_players()).unwrap();
         game.players[0].resources = Resources {
             brick: 4,
@@ -2092,9 +2179,22 @@ mod tests {
             grain: 2,
             ..Default::default()
         };
-        let before = game.players[0].resources.total();
+        game.phase = GamePhase::Turn(TurnPhase::ResolveSeven);
         game.discard_over_7();
-        assert_eq!(game.players[0].resources.total(), before - before / 2);
+        assert_eq!(game.pending_discards.get(&0), Some(&4));
+
+        game.apply_action(
+            0,
+            Action::Discard(Resources {
+                brick: 2,
+                lumber: 1,
+                grain: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(game.players[0].resources.total(), 5);
+        assert!(!game.pending_discards.contains_key(&0));
     }
 
     #[test]
@@ -2181,6 +2281,7 @@ mod tests {
             if game
                 .board
                 .adjacent_vertices(v)
+                .unwrap()
                 .iter()
                 .any(|&a| game.board.vertices[a].building.is_some())
             {
@@ -2296,6 +2397,7 @@ mod tests {
                 if game
                     .board
                     .adjacent_vertices(target)
+                    .unwrap()
                     .iter()
                     .any(|&a| game.board.vertices[a].building.is_some())
                 {
@@ -2319,6 +2421,7 @@ mod tests {
             if game
                 .board
                 .adjacent_vertices(v)
+                .unwrap()
                 .iter()
                 .any(|&a| game.board.vertices[a].building.is_some())
             {
@@ -2442,7 +2545,8 @@ mod tests {
             .find(|t| !t.has_robber)
             .map(|t| t.id)
             .unwrap();
-        game.apply_action(p2, Action::PlayKnight { tile, target: None })
+        let target = robber_target(&game, p2, tile);
+        game.apply_action(p2, Action::PlayKnight { tile, target })
             .unwrap();
         assert_eq!(game.players[p2].played_knights, 1);
         assert!(game.board.tiles[tile].has_robber);
@@ -2462,5 +2566,115 @@ mod tests {
             game.apply_action(p1, Action::RollDice).unwrap_err(),
             CatanError::GameFinished
         );
+    }
+
+    #[test]
+    fn game_rejects_non_contiguous_or_duplicate_player_ids() {
+        let non_contiguous = vec![
+            Player::new(0, "A", PlayerColor::Red),
+            Player::new(2, "B", PlayerColor::Blue),
+        ];
+        assert_eq!(
+            Game::new(non_contiguous).unwrap_err(),
+            CatanError::InvalidPlayer
+        );
+
+        let duplicate = vec![
+            Player::new(0, "A", PlayerColor::Red),
+            Player::new(0, "B", PlayerColor::Blue),
+        ];
+        assert_eq!(Game::new(duplicate).unwrap_err(), CatanError::InvalidPlayer);
+    }
+
+    #[test]
+    fn invalid_client_build_ids_return_errors() {
+        let mut game = Game::new(make_players()).unwrap();
+        let player = game.current_player();
+        assert_eq!(
+            game.apply_action(player, Action::PlaceSettlement(usize::MAX)),
+            Err(CatanError::InvalidBuildLocation)
+        );
+    }
+
+    #[test]
+    fn paid_road_requires_an_available_piece() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let player = game.current_player();
+        let edge = game
+            .board
+            .edges
+            .iter()
+            .find(|edge| game.can_build_road(player, edge.id))
+            .unwrap()
+            .id;
+        game.players[player].resources = road_cost();
+        game.players[player].remaining_roads = 0;
+        assert_eq!(
+            game.apply_action(player, Action::BuildRoad(edge)),
+            Err(CatanError::NoPiecesRemaining)
+        );
+    }
+
+    #[test]
+    fn invalid_knight_move_does_not_consume_card() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        let player = game.current_player();
+        game.players[player].hand.push(DevelopmentCard::Knight);
+        game.phase = GamePhase::Turn(TurnPhase::Main);
+
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::PlayKnight {
+                    tile: usize::MAX,
+                    target: None,
+                },
+            ),
+            Err(CatanError::InvalidRobberLocation)
+        );
+        assert!(game.players[player].hand.contains(&DevelopmentCard::Knight));
+        assert_eq!(game.players[player].played_knights, 0);
+        assert!(!game.played_dev_card_this_turn);
+    }
+
+    #[test]
+    fn hidden_victory_point_cards_can_win() {
+        let mut game = Game::new(make_players()).unwrap();
+        let player = game.current_player();
+        game.players[player].new_cards = vec![DevelopmentCard::VictoryPoint; 10];
+        game.check_winner();
+        assert_eq!(game.winner, Some(player));
+    }
+
+    #[test]
+    fn award_holders_keep_ties_and_longest_road_can_clear() {
+        let mut game = Game::new(make_players()).unwrap();
+        game.players[0].played_knights = 3;
+        game.recalculate_largest_army();
+        assert_eq!(game.largest_army, Some(0));
+        game.players[1].played_knights = 3;
+        game.recalculate_largest_army();
+        assert_eq!(game.largest_army, Some(0));
+        game.players[1].played_knights = 4;
+        game.recalculate_largest_army();
+        assert_eq!(game.largest_army, Some(1));
+
+        game.longest_road = Some(0);
+        game.recalculate_longest_road();
+        assert_eq!(game.longest_road, None);
+    }
+
+    #[test]
+    fn longest_road_counts_every_edge_in_a_cycle() {
+        let mut game = Game::new(make_players()).unwrap();
+        let player = game.current_player();
+        let edges = game.board.tiles[0].edges;
+        for edge in edges {
+            game.board.edges[edge].road = Some(player);
+        }
+        assert_eq!(game.longest_road_for_player(player), 6);
     }
 }

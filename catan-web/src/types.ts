@@ -87,6 +87,7 @@ export interface GameView {
   longest_road: number | null;
   largest_army: number | null;
   pending_trade: TradeOffer | null;
+  pending_discards: Record<number, number>;
   winner: number | null;
 }
 
@@ -113,13 +114,14 @@ export type Action =
   | { PlaceRoad: number }
   | 'RollDice'
   | { MoveRobber: { tile: number; target: number | null } }
+  | { Discard: Resources }
   | { BuildRoad: number }
   | { BuildSettlement: number }
   | { BuildCity: number }
   | 'BuyDevelopmentCard'
   | { PlayKnight: { tile: number; target: number | null } }
   | { PlayRoadBuilding: [number, number] }
-  | { PlayInvention: [Resource, Resource | null] }
+  | { PlayInvention: [Resource, Resource] }
   | { PlayMonopoly: Resource }
   | { OfferTrade: { to: number; give: Resources; receive: Resources } }
   | { RespondTrade: { accept: boolean } }

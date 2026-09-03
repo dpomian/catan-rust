@@ -56,7 +56,7 @@ enum ServerMessage {
         host: PlayerId,
     },
     GameState {
-        state: GameView,
+        state: Box<GameView>,
     },
 }
 
@@ -127,19 +127,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             });
                             continue;
                         }
-                        let (code, room) = create_room(name, tx.clone());
+                        let (code, room_arc) = {
+                            let mut app = state.inner.lock().unwrap();
+                            let code = generate_code(&app.rooms);
+                            let room = create_room(code.clone(), name, tx.clone());
+                            app.rooms.insert(code.clone(), room.clone());
+                            (code, room)
+                        };
                         player_id = Some(0);
                         room_code = Some(code.clone());
-
-                        {
-                            let mut app = state.inner.lock().unwrap();
-                            app.rooms.insert(code.clone(), room);
-                        }
-
-                        let room_arc = {
-                            let app = state.inner.lock().unwrap();
-                            app.rooms.get(&code).unwrap().clone()
-                        };
 
                         broadcast_lobby(&room_arc).await;
                     }
@@ -314,10 +310,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 fn create_room(
+    code: String,
     name: String,
     tx: mpsc::UnboundedSender<ServerMessage>,
-) -> (String, Arc<Mutex<GameRoom>>) {
-    let code = generate_code();
+) -> Arc<Mutex<GameRoom>> {
     let player = Player::new(0, name, PlayerColor::Red);
     let room = GameRoom {
         code: code.clone(),
@@ -331,10 +327,10 @@ fn create_room(
         started: false,
         game: None,
     };
-    (code, Arc::new(Mutex::new(room)))
+    Arc::new(Mutex::new(room))
 }
 
-fn generate_code() -> String {
+fn generate_code(rooms: &HashMap<String, Arc<Mutex<GameRoom>>>) -> String {
     let mut rng = rand::thread_rng();
     loop {
         let code: String = (&mut rng)
@@ -343,7 +339,7 @@ fn generate_code() -> String {
             .take(4)
             .map(char::from)
             .collect();
-        if !code.is_empty() {
+        if !rooms.contains_key(&code) {
             return code;
         }
     }
@@ -398,7 +394,9 @@ async fn broadcast_game_state(room_arc: &Arc<Mutex<GameRoom>>) {
 
     for (pid, view) in views {
         if let Some(tx) = connections.get(&pid) {
-            let _ = tx.send(ServerMessage::GameState { state: view });
+            let _ = tx.send(ServerMessage::GameState {
+                state: Box::new(view),
+            });
         }
     }
 }

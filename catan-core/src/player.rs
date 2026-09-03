@@ -57,10 +57,15 @@ impl Player {
 
     /// Count victory points visible to all players (revealed VP cards only).
     pub fn public_victory_points(&self) -> u8 {
-        // Buildings + VP cards already revealed. VP cards are revealed only when winning.
-        let mut vps = 0u8;
-        vps += self.victory_point_cards;
-        vps
+        self.victory_point_cards
+    }
+
+    pub fn hidden_victory_points(&self) -> u8 {
+        self.hand
+            .iter()
+            .chain(&self.new_cards)
+            .filter(|&&card| card == DevelopmentCard::VictoryPoint)
+            .count() as u8
     }
 
     /// Check whether this card can be played now (VP cards are always revealable).

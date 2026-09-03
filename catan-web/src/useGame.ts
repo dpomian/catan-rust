@@ -12,6 +12,7 @@ export interface GameHook {
   lobby: { code: string; players: LobbyPlayer[]; you: number; host: number } | null;
   game: GameView | null;
   send: (msg: ClientMessage) => void;
+  clearError: () => void;
 }
 
 export function useGame(): GameHook {
@@ -65,5 +66,7 @@ export function useGame(): GameHook {
     }
   }, []);
 
-  return { connected, error, lobby, game, send };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { connected, error, lobby, game, send, clearError };
 }

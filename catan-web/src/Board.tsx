@@ -8,6 +8,10 @@ interface BoardProps {
   selectableTiles?: boolean;
   selectableVertices?: boolean;
   selectableEdges?: boolean;
+  highlightTiles?: Set<number>;
+  highlightVertices?: Set<number>;
+  highlightEdges?: Set<number>;
+  selectedEdges?: Set<number>;
 }
 
 export function Board({
@@ -18,11 +22,15 @@ export function Board({
   selectableTiles,
   selectableVertices,
   selectableEdges,
+  highlightTiles,
+  highlightVertices,
+  highlightEdges,
+  selectedEdges,
 }: BoardProps) {
   return (
     <svg
       viewBox="-4 -4 8 8"
-      style={{ width: '100%', height: '100%', maxHeight: '80vh' }}
+      style={{ width: '100%', height: '100%', maxHeight: '80vh', display: 'block' }}
       preserveAspectRatio="xMidYMid meet"
     >
       {board.tiles.map((tile) => (
@@ -31,6 +39,7 @@ export function Board({
           tile={tile}
           vertices={board.vertices}
           onClick={selectableTiles ? onTileClick : undefined}
+          highlight={highlightTiles?.has(tile.id) ?? false}
         />
       ))}
       {board.edges.map((edge) => (
@@ -39,6 +48,8 @@ export function Board({
           edge={edge}
           vertices={board.vertices}
           onClick={selectableEdges ? onEdgeClick : undefined}
+          highlight={highlightEdges?.has(edge.id) ?? false}
+          selected={selectedEdges?.has(edge.id) ?? false}
         />
       ))}
       {board.vertices.map((vertex) => (
@@ -46,40 +57,33 @@ export function Board({
           key={vertex.id}
           vertex={vertex}
           onClick={selectableVertices ? onVertexClick : undefined}
+          highlight={highlightVertices?.has(vertex.id) ?? false}
         />
       ))}
     </svg>
   );
 }
 
-function terrainColor(t: Terrain): string {
-  switch (t) {
-    case 'Hills':
-      return '#e6b84d';
-    case 'Forest':
-      return '#4a8f4a';
-    case 'Mountains':
-      return '#8c8c8c';
-    case 'Fields':
-      return '#f2d65a';
-    case 'Pasture':
-      return '#7fbf7f';
-    case 'Desert':
-      return '#e6d7a3';
-  }
+function terrainClass(t: Terrain): string {
+  const map: Record<Terrain, string> = {
+    Hills: 'tile-hills',
+    Forest: 'tile-forest',
+    Mountains: 'tile-mountains',
+    Fields: 'tile-fields',
+    Pasture: 'tile-pasture',
+    Desert: 'tile-desert',
+  };
+  return map[t];
 }
 
-function playerColor(c: PlayerColor): string {
-  switch (c) {
-    case 'Red':
-      return '#d32f2f';
-    case 'Blue':
-      return '#1976d2';
-    case 'White':
-      return '#f5f5f5';
-    case 'Orange':
-      return '#f57c00';
-  }
+function playerClass(c: PlayerColor): string {
+  const map: Record<PlayerColor, string> = {
+    Red: 'player-red',
+    Blue: 'player-blue',
+    White: 'player-white',
+    Orange: 'player-orange',
+  };
+  return map[c];
 }
 
 function portLabel(port: Port): string {
@@ -114,32 +118,37 @@ function tileCenter(tile: Tile, vertices: Vertex[]): { x: number; y: number } {
   return { x, y };
 }
 
+function getPlayerColor(id: number): PlayerColor {
+  const colors: PlayerColor[] = ['Red', 'Blue', 'White', 'Orange'];
+  return colors[id % colors.length];
+}
+
 interface TileShapeProps {
   tile: Tile;
   vertices: Vertex[];
   onClick?: (id: number) => void;
+  highlight: boolean;
 }
 
-function TileShape({ tile, vertices, onClick }: TileShapeProps) {
+function TileShape({ tile, vertices, onClick, highlight }: TileShapeProps) {
   const center = tileCenter(tile, vertices);
   return (
-    <g>
+    <g className={`tile-shape ${highlight ? 'tile-highlight' : ''} ${onClick ? 'tile-clickable' : ''}`}>
       <polygon
+        className={`tile-base ${terrainClass(tile.terrain)}`}
         points={pointsFromVertices(tile, vertices)}
-        fill={terrainColor(tile.terrain)}
         stroke="#333"
         strokeWidth={0.05}
         onClick={() => onClick?.(tile.id)}
-        style={{ cursor: onClick ? 'pointer' : 'default' }}
       />
       {tile.number !== null && (
         <g transform={`translate(${center.x}, ${center.y})`}>
-          <circle r={0.35} fill="#f5f0e1" stroke="#333" strokeWidth={0.03} />
+          <circle className="number-disc" r={0.35} stroke="#333" strokeWidth={0.03} />
           <text
+            className={`number-token ${tile.number === 6 || tile.number === 8 ? 'red' : ''}`}
             textAnchor="middle"
             dominantBaseline="middle"
             fontSize={0.35}
-            fill={tile.number === 6 || tile.number === 8 ? '#c00' : '#333'}
             pointerEvents="none"
           >
             {tile.number}
@@ -147,8 +156,8 @@ function TileShape({ tile, vertices, onClick }: TileShapeProps) {
         </g>
       )}
       {tile.has_robber && (
-        <g transform={`translate(${center.x}, ${center.y})`}>
-          <circle r={0.2} fill="#111" stroke="#fff" strokeWidth={0.03} />
+        <g className="robber" transform={`translate(${center.x}, ${center.y})`}>
+          <circle r={0.2} stroke="#fff" strokeWidth={0.03} />
         </g>
       )}
     </g>
@@ -159,111 +168,70 @@ interface EdgeShapeProps {
   edge: Edge;
   vertices: Vertex[];
   onClick?: (id: number) => void;
+  highlight: boolean;
+  selected: boolean;
 }
 
-function EdgeShape({ edge, vertices, onClick }: EdgeShapeProps) {
+function EdgeShape({ edge, vertices, onClick, highlight, selected }: EdgeShapeProps) {
   const a = vertices[edge.endpoints[0]].position;
   const b = vertices[edge.endpoints[1]].position;
   const hasRoad = edge.road !== null;
-  const color = hasRoad ? playerColor(getPlayerColor(edge.road!)) : 'transparent';
+  const roadColorClass = hasRoad ? `road-${playerClass(getPlayerColor(edge.road!))}` : '';
 
   return (
-    <g onClick={() => onClick?.(edge.id)} style={{ cursor: onClick ? 'pointer' : 'default' }}>
-      <line
-        x1={a.x}
-        y1={a.y}
-        x2={b.x}
-        y2={b.y}
-        stroke={hasRoad ? color : 'transparent'}
-        strokeWidth={hasRoad ? 0.15 : 0.25}
-        strokeLinecap="round"
-        opacity={hasRoad ? 1 : 0.3}
-      />
-      {!hasRoad && onClick && (
-        <line
-          x1={a.x}
-          y1={a.y}
-          x2={b.x}
-          y2={b.y}
-          stroke="transparent"
-          strokeWidth={0.3}
-        />
-      )}
+    <g
+      className={`edge-shape ${onClick ? 'edge-clickable' : ''} ${highlight ? 'edge-highlight' : ''} ${selected ? 'edge-selected' : ''}`}
+      onClick={() => onClick?.(edge.id)}
+      style={{ cursor: onClick ? 'pointer' : 'default' }}
+    >
+      {!hasRoad && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} className="edge-base" />}
+      {hasRoad && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} className={`road ${roadColorClass}`} strokeWidth={0.15} />}
+      {onClick && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} className="edge-hit" />}
     </g>
   );
-}
-
-function getPlayerColor(id: number): PlayerColor {
-  const colors: PlayerColor[] = ['Red', 'Blue', 'White', 'Orange'];
-  return colors[id % colors.length];
 }
 
 interface VertexShapeProps {
   vertex: Vertex;
   onClick?: (id: number) => void;
+  highlight: boolean;
 }
 
-function VertexShape({ vertex, onClick }: VertexShapeProps) {
+function VertexShape({ vertex, onClick, highlight }: VertexShapeProps) {
   const { x, y } = vertex.position;
   const building = vertex.building;
   const hasBuilding = building !== null;
-  let color = '#333';
+  let ownerClass = '';
   let isCity = false;
   if (building) {
     if ('Settlement' in building) {
-      color = playerColor(getPlayerColor(building.Settlement));
+      ownerClass = playerClass(getPlayerColor(building.Settlement));
     } else {
-      color = playerColor(getPlayerColor(building.City));
+      ownerClass = playerClass(getPlayerColor(building.City));
       isCity = true;
     }
   }
 
   return (
     <g
+      className={`vertex-shape ${onClick ? 'vertex-clickable' : ''} ${highlight ? 'vertex-highlight' : ''}`}
       onClick={() => onClick?.(vertex.id)}
       style={{ cursor: onClick ? 'pointer' : 'default' }}
     >
-      {!hasBuilding && onClick && (
-        <circle cx={x} cy={y} r={0.18} fill="rgba(255,255,255,0.3)" stroke="none" />
-      )}
+      {highlight && !hasBuilding && <circle cx={x} cy={y} r={0.22} className="vertex-halo" />}
+      {!hasBuilding && onClick && <circle cx={x} cy={y} r={0.18} className="vertex-dot" />}
       {hasBuilding && !isCity && (
-        <circle cx={x} cy={y} r={0.18} fill={color} stroke="#111" strokeWidth={0.04} />
+        <circle cx={x} cy={y} r={0.18} className={`building settlement ${ownerClass}`} />
       )}
       {hasBuilding && isCity && (
-        <>
-          <rect
-            x={x - 0.18}
-            y={y - 0.18}
-            width={0.36}
-            height={0.36}
-            fill={color}
-            stroke="#111"
-            strokeWidth={0.04}
-          />
-          <rect
-            x={x - 0.1}
-            y={y - 0.3}
-            width={0.2}
-            height={0.15}
-            fill={color}
-            stroke="#111"
-            strokeWidth={0.04}
-          />
-        </>
+        <g className={`building city ${ownerClass}`}>
+          <rect x={x - 0.18} y={y - 0.18} width={0.36} height={0.36} />
+          <rect x={x - 0.1} y={y - 0.3} width={0.2} height={0.15} />
+        </g>
       )}
-      {!hasBuilding && (
-        <circle cx={x} cy={y} r={0.08} fill="#222" opacity={0.4} pointerEvents="none" />
-      )}
+      {!hasBuilding && <circle cx={x} cy={y} r={0.06} className="vertex-empty" pointerEvents="none" />}
       {vertex.port && (
-        <text
-          x={x}
-          y={y - 0.35}
-          textAnchor="middle"
-          fontSize={0.22}
-          fill="#111"
-          fontWeight="bold"
-          pointerEvents="none"
-        >
+        <text className="port-label" x={x} y={y - 0.35} textAnchor="middle" fontSize={0.22} fontWeight="bold" pointerEvents="none">
           {portLabel(vertex.port)}
         </text>
       )}

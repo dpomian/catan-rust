@@ -296,17 +296,17 @@ impl Board {
     }
 
     /// Return the vertices connected to this one by an edge.
-    pub fn adjacent_vertices(&self, vertex_id: VertexId) -> Vec<VertexId> {
+    pub fn adjacent_vertices(&self, vertex_id: VertexId) -> Option<Vec<VertexId>> {
         let mut result = Vec::new();
-        for edge_id in &self.vertices[vertex_id].incident_edges {
-            let edge = &self.edges[*edge_id];
+        for edge_id in &self.vertices.get(vertex_id)?.incident_edges {
+            let edge = self.edges.get(*edge_id)?;
             for &v in &edge.endpoints {
                 if v != vertex_id && !result.contains(&v) {
                     result.push(v);
                 }
             }
         }
-        result
+        Some(result)
     }
 
     /// Find the edge connecting two vertices, if any.
@@ -317,19 +317,9 @@ impl Board {
             .find(|e| e.endpoints == [key.0, key.1] || e.endpoints == [key.1, key.0])
             .map(|e| e.id)
     }
-
-    /// Check whether a road has been built on this edge.
-    pub fn is_edge_occupied(&self, edge_id: EdgeId) -> bool {
-        self.edges[edge_id].is_occupied()
-    }
 }
 
 impl Edge {
-    /// Check whether a road has been built on this edge.
-    pub fn is_occupied(&self) -> bool {
-        self.road.is_some()
-    }
-
     /// Return the opposite endpoint of this edge, if the vertex belongs to it.
     pub fn other_vertex(&self, vertex_id: VertexId) -> Option<VertexId> {
         if self.endpoints[0] == vertex_id {
@@ -498,7 +488,7 @@ mod tests {
             assert_eq!(tile.edges.len(), 6);
         }
         for edge in &board.edges {
-            assert!(edge.incident_tiles.len() >= 1);
+            assert!(!edge.incident_tiles.is_empty());
             assert!(edge.incident_tiles.len() <= 2);
         }
         for vertex in &board.vertices {
@@ -530,8 +520,8 @@ mod tests {
         for edge in &board.edges {
             let a = edge.endpoints[0];
             let b = edge.endpoints[1];
-            assert!(board.adjacent_vertices(a).contains(&b));
-            assert!(board.adjacent_vertices(b).contains(&a));
+            assert!(board.adjacent_vertices(a).unwrap().contains(&b));
+            assert!(board.adjacent_vertices(b).unwrap().contains(&a));
         }
     }
 
@@ -563,9 +553,23 @@ mod tests {
     }
 
     #[test]
-    fn is_edge_occupied_false_initially() {
+    fn invalid_graph_ids_are_rejected() {
         let board = Board::generate_geometry();
-        assert!(!board.is_edge_occupied(0));
+        assert_eq!(board.adjacent_vertices(usize::MAX), None);
+    }
+
+    #[test]
+    fn edge_lookup_and_road_state() {
+        let mut board = Board::generate_geometry();
+
+        let edge = board.edges.first().expect("valid edge");
+        assert!(edge.road.is_none());
+
+        board.edges[0].road = Some(0);
+        let edge = board.edges.first().expect("valid edge");
+        assert!(edge.road.is_some());
+
+        assert!(board.edges.get(usize::MAX).is_none());
     }
 
     #[test]

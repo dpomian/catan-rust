@@ -197,8 +197,11 @@ impl Resources {
     }
 
     /// Sum all resource counts.
-    pub fn total(&self) -> u8 {
-        self.brick + self.lumber + self.ore + self.grain + self.wool
+    pub fn total(&self) -> u16 {
+        [self.brick, self.lumber, self.ore, self.grain, self.wool]
+            .into_iter()
+            .map(u16::from)
+            .sum()
     }
 }
 
@@ -296,6 +299,17 @@ mod tests {
         r.brick = 0;
         assert!(!r.can_afford(&cost));
         assert_eq!(r.total(), 3);
+        assert_eq!(
+            Resources {
+                brick: u8::MAX,
+                lumber: u8::MAX,
+                ore: u8::MAX,
+                grain: u8::MAX,
+                wool: u8::MAX,
+            }
+            .total(),
+            1275
+        );
     }
 
     #[test]
