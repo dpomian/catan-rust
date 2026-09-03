@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# JavaScript / TypeScript dependencies
+node_modules/
+
+# Frontend build and test output
+dist/
+dist-ssr/
+coverage/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local environment and configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+
+# Editors and IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Operating system files
+.DS_Store
+Thumbs.db

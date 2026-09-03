@@ -1,0 +1,15 @@
+[package]
+name = "catan-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+catan-core = { path = "../catan-core" }
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+futures = "0.3"
