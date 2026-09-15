@@ -1,6 +1,6 @@
 use crate::types::*;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -87,15 +87,20 @@ const TERRAINS: [Terrain; 19] = [
 ];
 
 impl Board {
-    /// Create a standard randomized Catan board.
+    /// Create a standard randomized Catan board using the thread-local RNG.
     pub fn new_standard() -> Self {
+        Self::new_standard_with_rng(&mut thread_rng())
+    }
+
+    /// Create a standard randomized Catan board using the provided RNG.
+    pub fn new_standard_with_rng(rng: &mut impl RngCore) -> Self {
         let mut board = Self::generate_geometry();
-        board.assign_terrain_and_numbers();
+        board.assign_terrain_and_numbers(rng);
         board
     }
 
     /// Build the shared geometry for a standard Catan board (tiles, vertices, edges).
-    fn generate_geometry() -> Self {
+    pub(crate) fn generate_geometry() -> Self {
         let radius = 2;
         let size = 1.0;
         let sqrt3 = 3.0_f64.sqrt();
@@ -205,11 +210,9 @@ impl Board {
     }
 
     /// Randomly assign terrains and number tokens, leaving the desert empty.
-    fn assign_terrain_and_numbers(&mut self) {
-        let mut rng = thread_rng();
-
+    pub(crate) fn assign_terrain_and_numbers(&mut self, rng: &mut impl RngCore) {
         let mut terrains = TERRAINS.to_vec();
-        terrains.shuffle(&mut rng);
+        terrains.shuffle(rng);
 
         for (tile, terrain) in self.tiles.iter_mut().zip(terrains) {
             tile.terrain = terrain;

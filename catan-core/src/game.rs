@@ -1,12 +1,18 @@
 use crate::board::*;
 use crate::error::CatanError;
+use crate::log::{EventOutcome, EventSubscriber, GameEvent, GameLog, ResourceDelta, ResourcePayout};
 use crate::player::Player;
 use crate::types::*;
 use rand::Rng;
+use rand::RngCore;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnPhase {
@@ -64,10 +70,11 @@ pub enum Action {
     EndTurn,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Game {
     pub board: Board,
     pub players: Vec<Player>,
+    pub initial_players: Vec<Player>,
     pub player_order: Vec<PlayerId>,
     pub current_player_idx: usize,
     pub phase: GamePhase,
@@ -80,6 +87,64 @@ pub struct Game {
     pub winner: Option<PlayerId>,
     pub played_dev_card_this_turn: bool,
     pub trade_counter: u64,
+    pub seed: u64,
+    pub event_log: Vec<GameEvent>,
+    event_subscribers: Vec<Arc<dyn EventSubscriber>>,
+    rng: StdRng,
+    last_outcome: Option<EventOutcome>,
+}
+
+impl std::fmt::Debug for Game {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Game")
+            .field("board", &self.board)
+            .field("players", &self.players)
+            .field("initial_players", &self.initial_players)
+            .field("player_order", &self.player_order)
+            .field("current_player_idx", &self.current_player_idx)
+            .field("phase", &self.phase)
+            .field("dice", &self.dice)
+            .field("longest_road", &self.longest_road)
+            .field("largest_army", &self.largest_army)
+            .field("pending_trade", &self.pending_trade)
+            .field("pending_discards", &self.pending_discards)
+            .field("development_deck", &self.development_deck)
+            .field("winner", &self.winner)
+            .field("played_dev_card_this_turn", &self.played_dev_card_this_turn)
+            .field("trade_counter", &self.trade_counter)
+            .field("seed", &self.seed)
+            .field("event_log", &self.event_log)
+            .field("event_subscribers", &self.event_subscribers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Game {
+    fn eq(&self, other: &Self) -> bool {
+        self.board == other.board
+            && self.players == other.players
+            && self.initial_players == other.initial_players
+            && self.player_order == other.player_order
+            && self.current_player_idx == other.current_player_idx
+            && self.phase == other.phase
+            && self.dice == other.dice
+            && self.longest_road == other.longest_road
+            && self.largest_army == other.largest_army
+            && self.pending_trade == other.pending_trade
+            && self.pending_discards == other.pending_discards
+            && self.development_deck == other.development_deck
+            && self.winner == other.winner
+            && self.played_dev_card_this_turn == other.played_dev_card_this_turn
+            && self.trade_counter == other.trade_counter
+            && self.seed == other.seed
+            && self.event_log.len() == other.event_log.len()
+            && self
+                .event_log
+                .iter()
+                .zip(&other.event_log)
+                .all(|(left, right)| left.same_gameplay(right))
+        // event_subscribers are runtime wiring and intentionally excluded.
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +243,15 @@ impl Game {
 
     /// Create a new game with a randomized board, turn order, and shuffled dev-card deck.
     pub fn new(players: Vec<Player>) -> Result<Self, CatanError> {
+        let seed = thread_rng().next_u64();
+        Self::new_with_seed(players, seed)
+    }
+
+    /// Create a new game using the provided random seed.
+    ///
+    /// The same seed, players, and sequence of actions always reproduces the
+    /// same game state, which makes event-log replay deterministic.
+    pub fn new_with_seed(players: Vec<Player>, seed: u64) -> Result<Self, CatanError> {
         if players.len() < 2
             || players.len() > 4
             || players
@@ -188,17 +262,21 @@ impl Game {
             return Err(CatanError::InvalidPlayer);
         }
 
-        let board = Board::new_standard();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut board = Board::generate_geometry();
+        board.assign_terrain_and_numbers(&mut rng);
 
+        let initial_players = players.clone();
         let mut player_order: Vec<PlayerId> = players.iter().map(|p| p.id).collect();
-        player_order.shuffle(&mut thread_rng());
+        player_order.shuffle(&mut rng);
 
         let mut deck = development_deck();
-        deck.shuffle(&mut thread_rng());
+        deck.shuffle(&mut rng);
 
         Ok(Self {
             board,
             players,
+            initial_players,
             player_order,
             current_player_idx: 0,
             phase: GamePhase::Setup {
@@ -215,11 +293,51 @@ impl Game {
             winner: None,
             played_dev_card_this_turn: false,
             trade_counter: 0,
+            seed,
+            event_log: Vec::new(),
+            event_subscribers: Vec::new(),
+            rng,
+            last_outcome: None,
         })
     }
 
     pub fn current_player(&self) -> PlayerId {
         self.player_order[self.current_player_idx]
+    }
+
+    /// Return a replayable log for this game.
+    pub fn log(&self) -> GameLog {
+        GameLog {
+            seed: self.seed,
+            initial_players: self.initial_players.clone(),
+            initial_player_order: self.player_order.clone(),
+            events: self.event_log.clone(),
+        }
+    }
+
+    /// Reconstruct a game by replaying the events in `log`.
+    ///
+    /// This uses the stored seed to recreate the initial board, turn order, and
+    /// development deck, then applies every recorded action in order.
+    pub fn replay(log: &GameLog) -> Result<Self, CatanError> {
+        let mut game = Self::new_with_seed(log.initial_players.clone(), log.seed)?;
+        for event in &log.events {
+            game.apply_action(event.player, event.action)?;
+        }
+        Ok(game)
+    }
+
+    /// Register an event subscriber that receives every successfully applied
+    /// action as it happens.
+    pub fn subscribe(&mut self, subscriber: Arc<dyn EventSubscriber>) {
+        self.event_subscribers.push(subscriber);
+    }
+
+    fn publish_event(&mut self, event: GameEvent) {
+        for subscriber in &self.event_subscribers {
+            subscriber.on_event(&event);
+        }
+        self.event_log.push(event);
     }
 
     /// Apply a player action after validating turn order and game state.
@@ -233,6 +351,9 @@ impl Game {
             return Err(CatanError::InvalidPlayer);
         }
 
+        self.last_outcome = None;
+        let resources_before: Vec<Resources> =
+            self.players.iter().map(|p| p.resources).collect();
         let result = match self.phase {
             GamePhase::Finished => Err(CatanError::GameFinished),
             GamePhase::Setup { .. } => self.apply_setup_action(player, action),
@@ -241,8 +362,50 @@ impl Game {
 
         if result.is_ok() {
             self.check_winner();
+            let event = GameEvent {
+                sequence: self.event_log.len(),
+                player,
+                action,
+                outcome: self.last_outcome.take().unwrap_or(EventOutcome::None),
+                resource_changes: self.resource_changes_from(&resources_before),
+                timestamp_ms: Self::now_ms(),
+            };
+            self.publish_event(event);
         }
         result
+    }
+
+    fn resource_changes_from(&self, before: &[Resources]) -> Vec<ResourceDelta> {
+        let mut changes = Vec::new();
+        for (player, before) in self.players.iter().zip(before) {
+            let mut gained = Resources::zero();
+            let mut lost = Resources::zero();
+            for resource in Resource::all() {
+                let old = before.get(resource);
+                let new = player.resources.get(resource);
+                if new > old {
+                    gained.add(resource, new - old);
+                } else if old > new {
+                    lost.add(resource, old - new);
+                }
+            }
+            if gained.total() > 0 || lost.total() > 0 {
+                changes.push(ResourceDelta {
+                    player: player.id,
+                    gained,
+                    lost,
+                });
+            }
+        }
+        changes.sort_by_key(|change| change.player);
+        changes
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
     }
 
     /// Handle placement of settlements and roads during the two setup rounds.
@@ -264,6 +427,13 @@ impl Game {
             Action::PlaceSettlement(vertex_id) if awaiting_road.is_none() => {
                 self.validate_setup_settlement(player, vertex_id)?;
                 self.settle_building(vertex_id, Building::Settlement(player))?;
+                // A settlement can break an opponent's road network.
+                self.recalculate_longest_road();
+                // The second settlement grants one resource from each adjacent hex.
+                if round == 1 {
+                    let resources = self.collect_starting_resources(vertex_id);
+                    self.last_outcome = Some(EventOutcome::ResourcesGained { resources });
+                }
                 self.phase = GamePhase::Setup {
                     round,
                     reverse,
@@ -275,11 +445,6 @@ impl Game {
                 let settlement = awaiting_road.unwrap();
                 self.validate_setup_road(player, edge_id, settlement)?;
                 self.build_road(edge_id, player)?;
-
-                // If this is the second settlement, collect starting resources.
-                if round == 1 {
-                    self.collect_starting_resources(settlement)?;
-                }
 
                 self.advance_setup(round, reverse)
             }
@@ -451,19 +616,25 @@ impl Game {
 
     /// Roll two dice; on a 7 enter robber resolution, otherwise produce resources.
     fn roll_dice(&mut self) -> Result<(), CatanError> {
-        let d1 = thread_rng().gen_range(1..=6);
-        let d2 = thread_rng().gen_range(1..=6);
+        let d1 = self.rng.gen_range(1..=6);
+        let d2 = self.rng.gen_range(1..=6);
         self.dice = Some((d1, d2));
         let sum = d1 + d2;
 
-        if sum == 7 {
+        let production = if sum == 7 {
             self.discard_over_7();
             self.phase = GamePhase::Turn(TurnPhase::ResolveSeven);
-            return Ok(());
-        }
-
-        self.produce_resources(sum);
-        self.phase = GamePhase::Turn(TurnPhase::Main);
+            Vec::new()
+        } else {
+            let production = self.produce_resources(sum);
+            self.phase = GamePhase::Turn(TurnPhase::Main);
+            production
+        };
+        self.last_outcome = Some(EventOutcome::DiceRoll {
+            d1,
+            d2,
+            production,
+        });
         Ok(())
     }
 
@@ -499,23 +670,32 @@ impl Game {
     }
 
     /// Distribute resources to settlements and cities touching the rolled number.
-    fn produce_resources(&mut self, roll: u8) {
+    fn produce_resources(&mut self, roll: u8) -> Vec<ResourcePayout> {
+        let mut produced: HashMap<PlayerId, Resources> = HashMap::new();
         for tile in &self.board.tiles {
             if tile.has_robber || tile.number != Some(roll) {
                 continue;
             }
             if let Some(resource) = tile.terrain.resource() {
                 for &vertex_id in &tile.vertices {
-                    if let Some(Building::City(pid)) = self.board.vertices[vertex_id].building {
-                        self.players[pid].resources.add(resource, 2);
-                    } else if let Some(Building::Settlement(pid)) =
-                        self.board.vertices[vertex_id].building
-                    {
-                        self.players[pid].resources.add(resource, 1);
+                    let amount = match self.board.vertices[vertex_id].building {
+                        Some(Building::City(pid)) => Some((pid, 2)),
+                        Some(Building::Settlement(pid)) => Some((pid, 1)),
+                        _ => None,
+                    };
+                    if let Some((pid, amount)) = amount {
+                        produced.entry(pid).or_default().add(resource, amount);
+                        self.players[pid].resources.add(resource, amount);
                     }
                 }
             }
         }
+        let mut payouts: Vec<ResourcePayout> = produced
+            .into_iter()
+            .map(|(player, resources)| ResourcePayout { player, resources })
+            .collect();
+        payouts.sort_by_key(|p| p.player);
+        payouts
     }
 
     /// Move the robber to a new tile and optionally steal a card from an adjacent player.
@@ -565,19 +745,20 @@ impl Game {
         if let Some((target_id, resource)) = stolen {
             self.players[target_id].resources.sub(resource, 1);
             self.players[player].resources.add(resource, 1);
+            self.last_outcome = Some(EventOutcome::ResourceStolen { resource });
         }
 
         Ok(())
     }
 
     /// Pick a random resource card from a player, if they have any.
-    fn steal_random_card(&self, player_id: PlayerId) -> Option<Resource> {
+    fn steal_random_card(&mut self, player_id: PlayerId) -> Option<Resource> {
         let p = &self.players[player_id];
         let available: Vec<Resource> = Resource::all()
             .into_iter()
             .filter(|r| p.resources.get(*r) > 0)
             .collect();
-        available.choose(&mut thread_rng()).copied()
+        available.choose(&mut self.rng).copied()
     }
 
     /// Pay for and build a road, then recalculate longest road.
@@ -917,15 +1098,30 @@ impl Game {
         Ok(())
     }
 
-    /// Exchange any bundle of resources with the bank. The bank always accepts as long as the
-    /// player can afford what they are giving and the offer is non-empty.
+    /// Exchange resources with the bank at a fixed 4:1 rate. The player must give
+    /// exactly four of a single resource and receive exactly one of a different
+    /// resource; anything else is rejected (there are no harbors in this game).
     fn bank_trade(
         &mut self,
         player: PlayerId,
         give: Resources,
         receive: Resources,
     ) -> Result<(), CatanError> {
-        if give.total() == 0 || receive.total() == 0 {
+        let given: Vec<Resource> = Resource::all()
+            .into_iter()
+            .filter(|&r| give.get(r) > 0)
+            .collect();
+        let received: Vec<Resource> = Resource::all()
+            .into_iter()
+            .filter(|&r| receive.get(r) > 0)
+            .collect();
+
+        if give.total() != 4
+            || receive.total() != 1
+            || given.len() != 1
+            || received.len() != 1
+            || given[0] == received[0]
+        {
             return Err(CatanError::InvalidTrade);
         }
 
@@ -957,16 +1153,18 @@ impl Game {
     }
 
     /// Grant resources from the tiles touching the second setup settlement.
-    fn collect_starting_resources(&mut self, settlement: VertexId) -> Result<(), CatanError> {
+    fn collect_starting_resources(&mut self, settlement: VertexId) -> Resources {
         let current = self.current_player();
         let incident_tiles = self.board.vertices[settlement].incident_tiles.clone();
+        let mut gained = Resources::zero();
         for &tile_id in &incident_tiles {
             let tile = &self.board.tiles[tile_id];
             if let Some(resource) = tile.terrain.resource() {
+                gained.add(resource, 1);
                 self.players[current].resources.add(resource, 1);
             }
         }
-        Ok(())
+        gained
     }
 
     /// Place a building on the board and deduct a settlement piece when needed.
@@ -1968,6 +2166,26 @@ mod tests {
         assert_eq!(game.players[other].resources.grain, 0);
         assert_eq!(game.players[player].resources.grain, 3);
         assert_eq!(game.players[other].resources.brick, 2);
+        let mut expected = vec![
+            ResourceDelta {
+                player,
+                gained: Resources {
+                    grain: 3,
+                    ..Default::default()
+                },
+                lost: Resources::zero(),
+            },
+            ResourceDelta {
+                player: other,
+                gained: Resources::zero(),
+                lost: Resources {
+                    grain: 3,
+                    ..Default::default()
+                },
+            },
+        ];
+        expected.sort_by_key(|delta| delta.player);
+        assert_eq!(game.event_log.last().unwrap().resource_changes, expected);
     }
 
     #[test]
@@ -2007,6 +2225,32 @@ mod tests {
         assert_eq!(game.players[from].resources.lumber, 1);
         assert_eq!(game.players[to].resources.brick, 1);
         assert_eq!(game.players[to].resources.lumber, 0);
+        let mut expected = vec![
+            ResourceDelta {
+                player: from,
+                gained: Resources {
+                    lumber: 1,
+                    ..Default::default()
+                },
+                lost: Resources {
+                    brick: 1,
+                    ..Default::default()
+                },
+            },
+            ResourceDelta {
+                player: to,
+                gained: Resources {
+                    brick: 1,
+                    ..Default::default()
+                },
+                lost: Resources {
+                    lumber: 1,
+                    ..Default::default()
+                },
+            },
+        ];
+        expected.sort_by_key(|delta| delta.player);
+        assert_eq!(game.event_log.last().unwrap().resource_changes, expected);
     }
 
     #[test]
@@ -2113,26 +2357,195 @@ mod tests {
             lumber: 1,
             ..Default::default()
         };
+        // A mixed 2-for-2 bundle violates the fixed 4:1 bank rate.
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 1,
+                        lumber: 1,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        ore: 1,
+                        grain: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::InvalidTrade
+        );
+    }
+
+    #[test]
+    fn bank_trade_four_for_one_works() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let player = game.current_player();
+
+        game.players[player].resources = Resources {
+            brick: 4,
+            ..Default::default()
+        };
         game.apply_action(
             player,
             Action::BankTrade {
                 give: Resources {
-                    brick: 1,
-                    lumber: 1,
+                    brick: 4,
                     ..Default::default()
                 },
                 receive: Resources {
                     ore: 1,
-                    grain: 1,
                     ..Default::default()
                 },
             },
         )
         .unwrap();
-        assert_eq!(game.players[player].resources.brick, 1);
-        assert_eq!(game.players[player].resources.lumber, 0);
+        assert_eq!(game.players[player].resources.brick, 0);
         assert_eq!(game.players[player].resources.ore, 1);
-        assert_eq!(game.players[player].resources.grain, 1);
+        assert_eq!(
+            game.event_log.last().unwrap().resource_changes,
+            vec![ResourceDelta {
+                player,
+                gained: Resources {
+                    ore: 1,
+                    ..Default::default()
+                },
+                lost: Resources {
+                    brick: 4,
+                    ..Default::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn bank_trade_rejects_non_four_to_one_rates() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let player = game.current_player();
+
+        game.players[player].resources = Resources {
+            brick: 4,
+            lumber: 4,
+            ..Default::default()
+        };
+
+        // 3:1 is not a valid bank rate.
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 3,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        ore: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::InvalidTrade
+        );
+
+        // Four given for two received is not a valid bank rate.
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 4,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        ore: 2,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::InvalidTrade
+        );
+
+        // The given resources must be a single type, not a mixed bundle.
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 2,
+                        lumber: 2,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        ore: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::InvalidTrade
+        );
+
+        // Giving and receiving the same resource is pointless and invalid.
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 4,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        brick: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::InvalidTrade
+        );
+
+        // Nothing was traded away by the rejected offers.
+        assert_eq!(game.players[player].resources.brick, 4);
+        assert_eq!(game.players[player].resources.lumber, 4);
+        assert_eq!(game.players[player].resources.ore, 0);
+    }
+
+    #[test]
+    fn bank_trade_requires_enough_resources() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let player = game.current_player();
+
+        game.players[player].resources = Resources {
+            brick: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            game.apply_action(
+                player,
+                Action::BankTrade {
+                    give: Resources {
+                        brick: 4,
+                        ..Default::default()
+                    },
+                    receive: Resources {
+                        ore: 1,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err(),
+            CatanError::NotEnoughResources
+        );
     }
 
     #[test]
@@ -2183,6 +2596,19 @@ mod tests {
         .unwrap();
         assert_eq!(game.players[0].resources.total(), 5);
         assert!(!game.pending_discards.contains_key(&0));
+        assert_eq!(
+            game.event_log.last().unwrap().resource_changes,
+            vec![ResourceDelta {
+                player: 0,
+                gained: Resources::zero(),
+                lost: Resources {
+                    brick: 2,
+                    lumber: 1,
+                    grain: 1,
+                    ..Default::default()
+                },
+            }]
+        );
     }
 
     #[test]
@@ -2344,6 +2770,235 @@ mod tests {
         assert_eq!(game.longest_road, Some(player));
     }
 
+    /// Find a chain of `length` free edges starting from `start`, never entering an
+    /// occupied vertex and never revisiting a vertex.
+    fn road_chain_from(
+        game: &Game,
+        current: VertexId,
+        length: usize,
+        visited: &mut HashSet<VertexId>,
+    ) -> Option<Vec<EdgeId>> {
+        if length == 0 {
+            return Some(Vec::new());
+        }
+        for &edge_id in &game.board.vertices[current].incident_edges {
+            let edge = &game.board.edges[edge_id];
+            if edge.road.is_some() {
+                continue;
+            }
+            let next = edge.other_vertex(current).unwrap();
+            if game.board.vertices[next].building.is_some() || visited.contains(&next) {
+                continue;
+            }
+            visited.insert(next);
+            if let Some(mut rest) = road_chain_from(game, next, length - 1, visited) {
+                let mut chain = vec![edge_id];
+                chain.append(&mut rest);
+                return Some(chain);
+            }
+            visited.remove(&next);
+        }
+        None
+    }
+
+    /// Remove any roads already owned by the player so road-length assertions
+    /// are not inflated by roads placed during setup.
+    fn clear_player_roads(game: &mut Game, player: PlayerId) {
+        for edge in game.board.edges.iter_mut() {
+            if edge.road == Some(player) {
+                edge.road = None;
+            }
+        }
+    }
+
+    #[test]
+    fn longest_road_awarded_via_build_actions() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let player = game.current_player();
+        clear_player_roads(&mut game, player);
+
+        // Pay for and build five connected roads during the main phase.
+        game.players[player].resources = Resources {
+            brick: 10,
+            lumber: 10,
+            ..Default::default()
+        };
+        let start = game
+            .board
+            .vertices
+            .iter()
+            .find(|v| matches!(v.building, Some(Building::Settlement(pid)) if pid == player))
+            .map(|v| v.id)
+            .unwrap();
+        let mut visited = HashSet::from([start]);
+        let chain = road_chain_from(&game, start, 5, &mut visited).expect("five-edge road chain");
+        for &edge_id in &chain {
+            game.apply_action(player, Action::BuildRoad(edge_id))
+                .unwrap();
+        }
+
+        assert_eq!(game.longest_road_for_player(player), 5);
+        assert_eq!(game.longest_road, Some(player));
+        let view = game.view_for(player);
+        let mine = view.players.iter().find(|p| p.id == player).unwrap();
+        // Two setup settlements plus the longest-road bonus.
+        assert_eq!(mine.victory_points, 4);
+    }
+
+    #[test]
+    fn opponent_settlement_breaks_longest_road() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        enter_main_phase(&mut game);
+        let owner = game.current_player();
+        clear_player_roads(&mut game, owner);
+
+        // Owner builds a five-road chain and takes the longest road.
+        game.players[owner].resources = Resources {
+            brick: 10,
+            lumber: 10,
+            ..Default::default()
+        };
+        let start = game
+            .board
+            .vertices
+            .iter()
+            .find(|v| matches!(v.building, Some(Building::Settlement(pid)) if pid == owner))
+            .map(|v| v.id)
+            .unwrap();
+        let mut visited = HashSet::from([start]);
+        let chain = road_chain_from(&game, start, 5, &mut visited).expect("five-edge road chain");
+        for &edge_id in &chain {
+            game.apply_action(owner, Action::BuildRoad(edge_id))
+                .unwrap();
+        }
+        assert_eq!(game.longest_road, Some(owner));
+
+        game.apply_action(owner, Action::EndTurn).unwrap();
+        let breaker = game.current_player();
+        assert_ne!(breaker, owner);
+        enter_main_phase(&mut game);
+
+        // Vertices along the chain: start, v1, .., v5. Cutting at v2 or v3
+        // leaves both segments shorter than five roads.
+        let mut chain_vertices = vec![start];
+        let mut current = start;
+        for &edge_id in &chain {
+            current = game.board.edges[edge_id].other_vertex(current).unwrap();
+            chain_vertices.push(current);
+        }
+        let (cut_vertex, breaker_edge) = chain_vertices[2..=3]
+            .iter()
+            .copied()
+            .find_map(|vertex| {
+                let legal = game.board.vertices[vertex].building.is_none()
+                    && game
+                        .board
+                        .adjacent_vertices(vertex)
+                        .unwrap()
+                        .iter()
+                        .all(|&a| game.board.vertices[a].building.is_none());
+                if !legal {
+                    return None;
+                }
+                let edge = game.board.vertices[vertex]
+                    .incident_edges
+                    .iter()
+                    .copied()
+                    .find(|&e| game.board.edges[e].road.is_none())?;
+                Some((vertex, edge))
+            })
+            .expect("cut vertex with a free edge for the breaker's road");
+
+        // Give the breaker a road reaching the middle of the owner's chain,
+        // then legally build the settlement that breaks the chain.
+        game.board.edges[breaker_edge].road = Some(breaker);
+        game.players[breaker].resources = settlement_cost();
+        game.apply_action(breaker, Action::BuildSettlement(cut_vertex))
+            .unwrap();
+
+        // No segment is long enough anymore, so the award disappears.
+        assert_eq!(game.longest_road, None);
+        let view = game.view_for(owner);
+        let owner_view = view.players.iter().find(|p| p.id == owner).unwrap();
+        // Just the two setup settlements, no longest-road bonus.
+        assert_eq!(owner_view.victory_points, 2);
+    }
+
+    /// Find a chain of `length` free edges starting from an unoccupied vertex,
+    /// mirroring `longest_road_awarded_at_five`'s direct board manipulation.
+    fn find_chain(game: &Game, length: usize) -> Option<(VertexId, Vec<EdgeId>)> {
+        game.board
+            .vertices
+            .iter()
+            .filter(|v| v.building.is_none())
+            .find_map(|v| {
+                let mut visited = HashSet::from([v.id]);
+                road_chain_from(game, v.id, length, &mut visited).map(|chain| (v.id, chain))
+            })
+    }
+
+    /// Like `find_chain`, but the start vertex must not touch any of `player`'s
+    /// roads, so settling there cannot cut their road network in two.
+    fn find_chain_off_network(
+        game: &Game,
+        length: usize,
+        player: PlayerId,
+    ) -> Option<(VertexId, Vec<EdgeId>)> {
+        game.board
+            .vertices
+            .iter()
+            .filter(|v| {
+                v.building.is_none()
+                    && v.incident_edges
+                        .iter()
+                        .all(|&e| game.board.edges[e].road != Some(player))
+            })
+            .find_map(|v| {
+                let mut visited = HashSet::from([v.id]);
+                road_chain_from(game, v.id, length, &mut visited).map(|chain| (v.id, chain))
+            })
+    }
+
+    #[test]
+    fn longest_road_holder_keeps_tie_but_can_be_overtaken() {
+        let mut game = Game::new(make_players()).unwrap();
+        let (first, second) = (0, 1);
+
+        // First player takes the longest road at length five.
+        let (start, chain) = find_chain(&game, 5).expect("five-edge road chain");
+        game.board.vertices[start].building = Some(Building::Settlement(first));
+        for &edge_id in &chain {
+            game.board.edges[edge_id].road = Some(first);
+        }
+        game.recalculate_longest_road();
+        assert_eq!(game.longest_road, Some(first));
+
+        // Tying the holder at five roads is not enough to take the award.
+        let (start2, chain2) =
+            find_chain_off_network(&game, 6, first).expect("six-edge road chain");
+        game.board.vertices[start2].building = Some(Building::Settlement(second));
+        for &edge_id in &chain2[..5] {
+            game.board.edges[edge_id].road = Some(second);
+        }
+        game.recalculate_longest_road();
+        assert_eq!(game.longest_road, Some(first));
+
+        // The sixth road strictly exceeds the holder's and takes the award.
+        game.board.edges[chain2[5]].road = Some(second);
+        game.recalculate_longest_road();
+        assert_eq!(game.longest_road, Some(second));
+
+        let view = game.view_for(second);
+        let second_view = view.players.iter().find(|p| p.id == second).unwrap();
+        // Settlement plus the longest-road bonus.
+        assert_eq!(second_view.victory_points, 3);
+        let first_view = view.players.iter().find(|p| p.id == first).unwrap();
+        assert_eq!(first_view.victory_points, 1);
+    }
+
     #[test]
     fn largest_army_awarded_at_three_knights() {
         let mut game = Game::new(make_players()).unwrap();
@@ -2351,6 +3006,53 @@ mod tests {
         game.players[player].played_knights = 3;
         game.recalculate_largest_army();
         assert_eq!(game.largest_army, Some(player));
+    }
+
+    #[test]
+    fn largest_army_awarded_via_knight_plays() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+        let player = game.current_player();
+        let rival = other_player(&game, player);
+
+        // Play three knights across three turns (one dev card per turn).
+        for _ in 0..3 {
+            game.players[player].resources = Resources::zero();
+            game.players[rival].resources = Resources::zero();
+            game.players[player].hand.push(DevelopmentCard::Knight);
+            let tile = game
+                .board
+                .tiles
+                .iter()
+                .find(|t| !t.has_robber)
+                .map(|t| t.id)
+                .unwrap();
+            let target = robber_target(&game, player, tile);
+            game.apply_action(player, Action::PlayKnight { tile, target })
+                .unwrap();
+            enter_main_phase(&mut game);
+            game.apply_action(player, Action::EndTurn).unwrap();
+
+            game.players[player].resources = Resources::zero();
+            game.players[rival].resources = Resources::zero();
+            enter_main_phase(&mut game);
+            game.apply_action(rival, Action::EndTurn).unwrap();
+        }
+
+        assert_eq!(game.players[player].played_knights, 3);
+        assert_eq!(game.largest_army, Some(player));
+        let view = game.view_for(player);
+        let mine = view.players.iter().find(|p| p.id == player).unwrap();
+        // Two setup settlements plus the largest-army bonus.
+        assert_eq!(mine.victory_points, 4);
+
+        // A second player with four knights takes the award.
+        game.players[rival].played_knights = 4;
+        game.recalculate_largest_army();
+        assert_eq!(game.largest_army, Some(rival));
+        let view = game.view_for(player);
+        let mine = view.players.iter().find(|p| p.id == player).unwrap();
+        assert_eq!(mine.victory_points, 2);
     }
 
     fn force_main_phase(game: &mut Game) {
@@ -2664,5 +3366,321 @@ mod tests {
             game.board.edges[edge].road = Some(player);
         }
         assert_eq!(game.longest_road_for_player(player), 6);
+    }
+
+    fn robber_target_for_tile(game: &Game, player: PlayerId, tile: TileId) -> Option<PlayerId> {
+        game.board.tiles[tile]
+            .vertices
+            .iter()
+            .filter_map(|&vertex| match game.board.vertices[vertex].building {
+                Some(Building::Settlement(pid) | Building::City(pid))
+                    if pid != player && game.players[pid].resources.total() > 0 =>
+                {
+                    Some(pid)
+                }
+                _ => None,
+            })
+            .next()
+    }
+
+    #[test]
+    fn event_log_replays_full_game_state() {
+        let mut game = Game::new_with_seed(make_players(), 12345).unwrap();
+        run_setup(&mut game);
+
+        // Run a handful of turns, resolving sevens when they appear.
+        for _ in 0..6 {
+            let player = game.current_player();
+            game.apply_action(player, Action::RollDice).unwrap();
+
+            if let GamePhase::Turn(TurnPhase::ResolveSeven) = game.phase {
+                let tile = game
+                    .board
+                    .tiles
+                    .iter()
+                    .find(|t| !t.has_robber && t.terrain != Terrain::Desert)
+                    .map(|t| t.id)
+                    .unwrap();
+                let target = robber_target_for_tile(&game, player, tile);
+                game.apply_action(player, Action::MoveRobber { tile, target })
+                    .unwrap();
+            }
+
+            game.apply_action(player, Action::EndTurn).unwrap();
+        }
+
+        let log = game.log();
+        let replayed = Game::replay(&log).unwrap();
+
+        assert_eq!(game, replayed);
+        assert_eq!(game.board, replayed.board);
+        assert_eq!(game.players, replayed.players);
+        assert_eq!(game.phase, replayed.phase);
+        assert_eq!(game.dice, replayed.dice);
+        assert_eq!(game.winner, replayed.winner);
+    }
+
+    #[test]
+    fn invalid_actions_are_not_logged() {
+        let mut game = Game::new(make_players()).unwrap();
+        let current = game.current_player();
+        let other = other_player(&game, current);
+        let result = game.apply_action(other, Action::RollDice);
+        assert_eq!(result.unwrap_err(), CatanError::NotYourTurn);
+        assert!(game.event_log.is_empty());
+    }
+
+    #[test]
+    fn event_log_records_timestamps() {
+        let before = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let mut game = Game::new(make_players()).unwrap();
+        let player = game.current_player();
+        let vertex = valid_settlement_vertex(&game).unwrap();
+        game.apply_action(player, Action::PlaceSettlement(vertex))
+            .unwrap();
+        let timestamp = game.event_log[0].timestamp_ms;
+        assert!(timestamp >= before);
+        assert!(timestamp > 0);
+    }
+
+    #[test]
+    fn event_log_records_dice_rolls_and_robber_outcomes() {
+        // Try seeds until the first roll is a 7 so we can exercise the robber path.
+        let mut game = None;
+        for seed in 0..10_000u64 {
+            let mut g = Game::new_with_seed(make_players(), seed).unwrap();
+            run_setup(&mut g);
+            let player = g.current_player();
+            g.apply_action(player, Action::RollDice).unwrap();
+            if let GamePhase::Turn(TurnPhase::ResolveSeven) = g.phase {
+                game = Some((g, player));
+                break;
+            }
+        }
+        let (mut game, player) = game.expect("found a seed that rolls a 7");
+
+        let tile = game
+            .board
+            .tiles
+            .iter()
+            .find(|t| !t.has_robber && t.terrain != Terrain::Desert)
+            .map(|t| t.id)
+            .unwrap();
+        let target = robber_target_for_tile(&game, player, tile);
+        game.apply_action(player, Action::MoveRobber { tile, target })
+            .unwrap();
+
+        let dice_events: Vec<_> = game
+            .event_log
+            .iter()
+            .filter(|e| matches!(e.outcome, EventOutcome::DiceRoll { .. }))
+            .collect();
+        assert_eq!(dice_events.len(), 1);
+
+        let robber_events: Vec<_> = game
+            .event_log
+            .iter()
+            .filter(|e| matches!(e.action, Action::MoveRobber { .. }))
+            .collect();
+        assert_eq!(robber_events.len(), 1);
+        let robber = robber_events[0];
+        match (&robber.action, &robber.outcome) {
+            (
+                Action::MoveRobber {
+                    target: Some(victim),
+                    ..
+                },
+                EventOutcome::ResourceStolen { resource },
+            ) => {
+                let mut stolen = Resources::zero();
+                stolen.add(*resource, 1);
+                let mut expected = vec![
+                    ResourceDelta {
+                        player,
+                        gained: stolen,
+                        lost: Resources::zero(),
+                    },
+                    ResourceDelta {
+                        player: *victim,
+                        gained: Resources::zero(),
+                        lost: stolen,
+                    },
+                ];
+                expected.sort_by_key(|delta| delta.player);
+                assert_eq!(robber.resource_changes, expected);
+            }
+            _ => assert!(robber.resource_changes.is_empty()),
+        }
+    }
+
+    #[test]
+    fn event_log_records_resource_production() {
+        let mut game = None;
+        for seed in 0..10_000u64 {
+            let mut g = Game::new_with_seed(make_players(), seed).unwrap();
+            run_setup(&mut g);
+            let player = g.current_player();
+            g.apply_action(player, Action::RollDice).unwrap();
+            if matches!(g.phase, GamePhase::Turn(TurnPhase::Main)) {
+                game = Some(g);
+                break;
+            }
+        }
+        let game = game.expect("found a seed that does not roll a 7");
+        let (d1, d2) = game.dice.expect("dice were rolled");
+        let roll = d1 + d2;
+        assert_ne!(roll, 7);
+
+        let event = game
+            .event_log
+            .iter()
+            .rev()
+            .find(|e| matches!(e.action, Action::RollDice))
+            .expect("roll event");
+        let EventOutcome::DiceRoll { production, .. } = &event.outcome else {
+            panic!("expected dice roll outcome");
+        };
+
+        let mut expected: HashMap<PlayerId, Resources> = HashMap::new();
+        for tile in &game.board.tiles {
+            if tile.has_robber || tile.number != Some(roll) {
+                continue;
+            }
+            let Some(resource) = tile.terrain.resource() else {
+                continue;
+            };
+            for &vertex_id in &tile.vertices {
+                match game.board.vertices[vertex_id].building {
+                    Some(Building::City(pid)) => {
+                        expected.entry(pid).or_default().add(resource, 2);
+                    }
+                    Some(Building::Settlement(pid)) => {
+                        expected.entry(pid).or_default().add(resource, 1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut expected: Vec<ResourcePayout> = expected
+            .into_iter()
+            .map(|(player, resources)| ResourcePayout { player, resources })
+            .collect();
+        expected.sort_by_key(|p| p.player);
+        assert_eq!(production, &expected);
+        let expected_changes: Vec<ResourceDelta> = expected
+            .into_iter()
+            .map(|payout| ResourceDelta {
+                player: payout.player,
+                gained: payout.resources,
+                lost: Resources::zero(),
+            })
+            .collect();
+        assert_eq!(event.resource_changes, expected_changes);
+    }
+
+    #[test]
+    fn event_log_records_starting_resources_on_second_settlement() {
+        let mut game = Game::new(make_players()).unwrap();
+        run_setup(&mut game);
+
+        let mut settlements_by_player: HashMap<PlayerId, usize> = HashMap::new();
+        let mut starting_payouts = 0;
+        for event in &game.event_log {
+            let Action::PlaceSettlement(vertex) = event.action else {
+                continue;
+            };
+            let count = settlements_by_player.entry(event.player).or_default();
+            *count += 1;
+            if *count == 1 {
+                assert_eq!(event.outcome, EventOutcome::None);
+                continue;
+            }
+
+            let EventOutcome::ResourcesGained { resources } = &event.outcome else {
+                panic!("expected starting resources on second settlement");
+            };
+            let mut expected = Resources::zero();
+            for &tile_id in &game.board.vertices[vertex].incident_tiles {
+                if let Some(resource) = game.board.tiles[tile_id].terrain.resource() {
+                    expected.add(resource, 1);
+                }
+            }
+            assert_eq!(resources, &expected);
+            assert_eq!(
+                event.resource_changes,
+                vec![ResourceDelta {
+                    player: event.player,
+                    gained: expected,
+                    lost: Resources::zero(),
+                }]
+            );
+            starting_payouts += 1;
+        }
+        assert_eq!(starting_payouts, game.players.len());
+    }
+
+    #[test]
+    fn game_log_serializes_and_deserializes() {
+        let mut game = Game::new_with_seed(make_players(), 42).unwrap();
+        run_setup(&mut game);
+        let player = game.current_player();
+        game.apply_action(player, Action::RollDice).unwrap();
+        if let GamePhase::Turn(TurnPhase::ResolveSeven) = game.phase {
+            let tile = game
+                .board
+                .tiles
+                .iter()
+                .find(|t| !t.has_robber && t.terrain != Terrain::Desert)
+                .map(|t| t.id)
+                .unwrap();
+            let target = robber_target_for_tile(&game, player, tile);
+            game.apply_action(player, Action::MoveRobber { tile, target })
+                .unwrap();
+        }
+
+        let log = game.log();
+        let json = serde_json::to_string(&log).unwrap();
+        let decoded: GameLog = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.seed, log.seed);
+        assert_eq!(decoded.events.len(), log.events.len());
+        assert_eq!(decoded.events, log.events);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSubscriber {
+        count: AtomicUsize,
+    }
+
+    impl CountingSubscriber {
+        fn new() -> Self {
+            Self {
+                count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl EventSubscriber for CountingSubscriber {
+        fn on_event(&self, _event: &GameEvent) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn event_subscribers_receive_applied_events() {
+        let subscriber = Arc::new(CountingSubscriber::new());
+        let mut game = Game::new(make_players()).unwrap();
+        game.subscribe(subscriber.clone());
+        run_setup(&mut game);
+
+        // Setup consists of 4 settlement placements and 4 road placements.
+        assert_eq!(subscriber.count.load(Ordering::SeqCst), 8);
     }
 }

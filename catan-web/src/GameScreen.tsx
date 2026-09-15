@@ -2,7 +2,8 @@ import { useMemo } from 'react';
 import { Board } from './Board';
 import { Controls } from './Controls';
 import type { Pending } from './Controls';
-import type { Action, GameView, PlayerView } from './types';
+import { GameLogPanel } from './GameLogPanel';
+import type { Action, GameLog, GameView, PlayerView } from './types';
 import {
   validCityVertices,
   validRoadEdges,
@@ -14,6 +15,7 @@ import {
 
 interface GameScreenProps {
   game: GameView;
+  log: GameLog | null;
   send: (action: Action) => void;
   pending: Pending | null;
   setPending: (pending: Pending | null) => void;
@@ -28,7 +30,7 @@ const colorMap: Record<string, string> = {
   Orange: '#f57c00',
 };
 
-export function GameScreen({ game, send, pending, setPending, robberTile, setRobberTile }: GameScreenProps) {
+export function GameScreen({ game, log, send, pending, setPending, robberTile, setRobberTile }: GameScreenProps) {
   const me = game.players.find((p) => p.id === game.my_id)!;
   const current = game.players.find((p) => p.id === game.current_player)!;
   const phase = game.phase;
@@ -188,6 +190,7 @@ export function GameScreen({ game, send, pending, setPending, robberTile, setRob
             </div>
           )}
           <Controls game={game} me={me} send={send} setPending={setPending} pending={pending} />
+          <GameLogPanel log={log} players={game.players} board={game.board} />
         </div>
       </div>
     </div>

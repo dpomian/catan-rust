@@ -1,1 +1,61 @@
 /* App-specific styles live in index.css and component files. */
+
+/* --- Game log panel --- */
+
+.game-log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.game-log-panel h4 {
+  margin: 0;
+}
+
+.game-log-list {
+  overflow-y: auto;
+  max-height: 320px;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.5rem 0.6rem;
+  background: #f8f8f6;
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+}
+
+.game-log-event {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.game-log-entry {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.game-log-detail {
+  padding-left: 0.75rem;
+  color: #555;
+}
+
+.game-log-time {
+  font-variant-numeric: tabular-nums;
+  color: #8a8a8a;
+  font-size: 0.75rem;
+  margin-right: 0.4rem;
+}
+
+.game-log-name {
+  font-weight: 600;
+}
+
+.game-log-empty {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}

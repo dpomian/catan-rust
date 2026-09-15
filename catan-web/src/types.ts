@@ -92,10 +92,58 @@ export interface GameView {
   winner: number | null;
 }
 
+export interface LogPlayer {
+  id: number;
+  name: string;
+  color: PlayerColor;
+  resources: Resources;
+  hand: DevelopmentCard[];
+  new_cards: DevelopmentCard[];
+  played_knights: number;
+  victory_point_cards: number;
+  remaining_roads: number;
+  remaining_settlements: number;
+  remaining_cities: number;
+}
+
+export interface ResourcePayout {
+  player: number;
+  resources: Resources;
+}
+
+export interface ResourceDelta {
+  player: number;
+  gained: Resources;
+  lost: Resources;
+}
+
+export type EventOutcome =
+  | 'None'
+  | { DiceRoll: { d1: number; d2: number; production?: ResourcePayout[] } }
+  | { ResourceStolen: { resource: Resource } }
+  | { ResourcesGained: { resources: Resources } };
+
+export interface GameEvent {
+  sequence: number;
+  player: number;
+  action: Action;
+  outcome: EventOutcome;
+  resource_changes?: ResourceDelta[];
+  timestamp_ms?: number;
+}
+
+export interface GameLog {
+  seed: number;
+  initial_players: LogPlayer[];
+  initial_player_order: number[];
+  events: GameEvent[];
+}
+
 export type ServerMessage =
   | { type: 'Error'; message: string }
   | { type: 'LobbyState'; code: string; players: LobbyPlayer[]; you: number; host: number }
   | { type: 'GameState'; state: GameView }
+  | { type: 'GameLog'; log: GameLog }
   | { type: 'Info'; message: string };
 
 export interface LobbyPlayer {
@@ -108,7 +156,8 @@ export type ClientMessage =
   | { type: 'CreateGame'; name: string }
   | { type: 'JoinGame'; code: string; name: string }
   | { type: 'StartGame' }
-  | { type: 'Action'; action: Action };
+  | { type: 'Action'; action: Action }
+  | { type: 'RequestLog' };
 
 export type Action =
   | { PlaceSettlement: number }

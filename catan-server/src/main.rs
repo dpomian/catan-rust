@@ -5,13 +5,17 @@ use axum::{
     response::Response,
     routing::get,
 };
-use catan_core::{Action, CatanError, Game, GameView, Player, PlayerColor, PlayerId};
+use catan_core::{
+    Action, CatanError, EventSubscriber, Game, GameEvent, GameLog, GameView, Player, PlayerColor,
+    PlayerId,
+};
 use futures::SinkExt;
 use futures::stream::StreamExt;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -42,6 +46,7 @@ enum ClientMessage {
     JoinGame { code: String, name: String },
     StartGame,
     Action { action: Action },
+    RequestLog,
 }
 
 #[derive(Serialize, Clone)]
@@ -59,6 +64,9 @@ enum ServerMessage {
     GameState {
         state: Box<GameView>,
     },
+    GameLog {
+        log: GameLog,
+    },
 }
 
 #[derive(Serialize, Clone)]
@@ -66,6 +74,44 @@ struct LobbyPlayer {
     id: PlayerId,
     name: String,
     color: PlayerColor,
+}
+
+/// Writes every received event as a JSON line to a log file.
+///
+/// The file is created on first use and appended to for the lifetime of the
+/// subscriber. Each line is a single `GameEvent` so the resulting `.jsonl`
+/// file can be replayed or processed line-by-line.
+struct FileSubscriber {
+    writer: Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl FileSubscriber {
+    fn new(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            writer: Mutex::new(std::io::BufWriter::new(file)),
+        })
+    }
+}
+
+impl EventSubscriber for FileSubscriber {
+    fn on_event(&self, event: &GameEvent) {
+        let Ok(line) = serde_json::to_string(event) else {
+            eprintln!("failed to serialize game event");
+            return;
+        };
+        let mut writer = self.writer.lock().unwrap();
+        if let Err(err) = writeln!(writer, "{}", line) {
+            eprintln!("failed to write game event to log file: {}", err);
+            return;
+        }
+        if let Err(err) = writer.flush() {
+            eprintln!("failed to flush game event log file: {}", err);
+        }
+    }
 }
 
 #[tokio::main]
@@ -207,7 +253,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     false
                                 } else {
                                     match Game::new(room.players.clone()) {
-                                        Ok(game) => {
+                                        Ok(mut game) => {
+                                            let log_dir = std::path::Path::new("logs");
+                                            if std::fs::create_dir_all(log_dir).is_ok() {
+                                                let log_path =
+                                                    log_dir.join(format!("{}.jsonl", room.code));
+                                                if let Ok(subscriber) =
+                                                    FileSubscriber::new(log_path)
+                                                {
+                                                    game.subscribe(Arc::new(subscriber));
+                                                }
+                                            }
                                             room.players.clear();
                                             room.game = Some(game);
                                             room.started = true;
@@ -223,6 +279,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             } else {
                                 let _ = tx.send(ServerMessage::Error {
                                     message: "Cannot start game".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    ClientMessage::RequestLog => {
+                        let Some(ref code) = room_code else {
+                            continue;
+                        };
+                        let room_arc = {
+                            let app = state.inner.lock().unwrap();
+                            app.rooms.get(code).cloned()
+                        };
+                        if let Some(room_arc) = room_arc {
+                            let log = {
+                                let room = room_arc.lock().unwrap();
+                                room.game.as_ref().map(|game| game.log())
+                            };
+                            if let Some(log) = log {
+                                let _ = tx.send(ServerMessage::GameLog { log });
+                            } else {
+                                let _ = tx.send(ServerMessage::Error {
+                                    message: "Game has not started".to_string(),
                                 });
                             }
                         }
@@ -410,7 +488,7 @@ async fn broadcast_lobby(room_arc: &Arc<Mutex<GameRoom>>) {
 }
 
 async fn broadcast_game_state(room_arc: &Arc<Mutex<GameRoom>>) {
-    let (connections, views) = {
+    let (connections, views, log) = {
         let room = room_arc.lock().unwrap();
         let Some(game) = room.game.as_ref() else {
             return;
@@ -421,7 +499,8 @@ async fn broadcast_game_state(room_arc: &Arc<Mutex<GameRoom>>) {
             .filter(|&&pid| pid < game.players.len())
             .map(|&pid| (pid, game.view_for(pid)))
             .collect();
-        (room.connections.clone(), views)
+        let log = game.log();
+        (room.connections.clone(), views, log)
     };
 
     for (pid, view) in views {
@@ -429,6 +508,7 @@ async fn broadcast_game_state(room_arc: &Arc<Mutex<GameRoom>>) {
             let _ = tx.send(ServerMessage::GameState {
                 state: Box::new(view),
             });
+            let _ = tx.send(ServerMessage::GameLog { log: log.clone() });
         }
     }
 }

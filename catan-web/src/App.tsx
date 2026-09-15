@@ -13,7 +13,7 @@ const colorMap: Record<string, string> = {
 };
 
 function App() {
-  const { connected, error, lobby, game, send, clearError } = useGame();
+  const { connected, error, lobby, game, log, send, clearError } = useGame();
   const [name, setName] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [pending, setPending] = useState<Pending | null>(null);
@@ -87,6 +87,7 @@ function App() {
     return (
       <GameScreen
         game={game}
+        log={log}
         send={sendAction}
         pending={pending}
         setPending={setPending}

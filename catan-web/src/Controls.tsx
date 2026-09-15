@@ -202,10 +202,20 @@ function TradePanel({
     }
   }, [pendingOffer, offerSubmitted, onClose]);
 
+  const giveEntries = resourceEntries(give);
+  const receiveEntries = resourceEntries(receive);
+  const isValidBankTrade =
+    giveEntries.length === 1 &&
+    giveEntries[0].count === 4 &&
+    receiveEntries.length === 1 &&
+    receiveEntries[0].count === 1 &&
+    giveEntries[0].resource !== receiveEntries[0].resource;
+
   const canSubmit =
     totalResources(give) > 0 &&
     totalResources(receive) > 0 &&
-    canAfford(me.my_resources, give);
+    canAfford(me.my_resources, give) &&
+    (mode !== 'bank' || isValidBankTrade);
 
   const submit = () => {
     if (!canSubmit) return;
@@ -284,7 +294,7 @@ function TradePanel({
           {mode === 'bank' ? 'Trade with Bank' : 'Offer to Players'}
         </button>
         {mode === 'bank' && (
-          <p className="trade-hint">The bank will always accept as long as you can pay.</p>
+          <p className="trade-hint">Bank rate is always 4:1 — give 4 of one resource for 1 of another.</p>
         )}
       </div>
     </div>

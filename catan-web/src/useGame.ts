@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ClientMessage, GameView, LobbyPlayer, ServerMessage } from './types';
+import type { ClientMessage, GameLog, GameView, LobbyPlayer, ServerMessage } from './types';
 
 const WS_URL =
   typeof window !== 'undefined' && window.location.protocol === 'https:'
@@ -11,6 +11,7 @@ export interface GameHook {
   error: string | null;
   lobby: { code: string; players: LobbyPlayer[]; you: number; host: number } | null;
   game: GameView | null;
+  log: GameLog | null;
   send: (msg: ClientMessage) => void;
   clearError: () => void;
 }
@@ -20,6 +21,7 @@ export function useGame(): GameHook {
   const [error, setError] = useState<string | null>(null);
   const [lobby, setLobby] = useState<GameHook['lobby']>(null);
   const [game, setGame] = useState<GameView | null>(null);
+  const [log, setLog] = useState<GameLog | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -42,11 +44,14 @@ export function useGame(): GameHook {
           setError(null);
         } else if (msg.type === 'LobbyState') {
           setLobby(msg);
+          setLog(null);
           setError(null);
         } else if (msg.type === 'GameState') {
           setGame(msg.state);
           setLobby(null);
           setError(null);
+        } else if (msg.type === 'GameLog') {
+          setLog(msg.log);
         }
       } catch (e) {
         setError('Failed to parse server message');
@@ -68,5 +73,5 @@ export function useGame(): GameHook {
 
   const clearError = useCallback(() => setError(null), []);
 
-  return { connected, error, lobby, game, send, clearError };
+  return { connected, error, lobby, game, log, send, clearError };
 }
