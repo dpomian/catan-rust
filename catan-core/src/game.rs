@@ -1,6 +1,9 @@
 use crate::board::*;
 use crate::error::CatanError;
-use crate::log::{EventOutcome, EventSubscriber, GameEvent, GameLog, ResourceDelta, ResourcePayout};
+use crate::log::{
+    AwardChange, DiscardDemand, EventOutcome, EventSubscriber, GameAward, GameEvent, GameLog,
+    ResourceDelta, ResourcePayout,
+};
 use crate::player::Player;
 use crate::types::*;
 use rand::Rng;
@@ -152,6 +155,7 @@ pub struct PlayerView {
     pub id: PlayerId,
     pub name: String,
     pub color: PlayerColor,
+    pub is_bot: bool,
     pub resource_count: u16,
     pub dev_card_count: u8,
     pub victory_points: u8,
@@ -192,9 +196,10 @@ impl Game {
                 let is_me = p.id == player_id;
                 let public_vps = self.settlement_city_points(p.id)
                     + self.longest_road_points(p.id)
-                    + self.largest_army_points(p.id);
+                    + self.largest_army_points(p.id)
+                    + p.victory_point_cards;
                 let vps = if is_me {
-                    public_vps + p.victory_point_cards + p.hidden_victory_points()
+                    public_vps + p.hidden_victory_points()
                 } else {
                     public_vps
                 };
@@ -202,6 +207,7 @@ impl Game {
                     id: p.id,
                     name: p.name.clone(),
                     color: p.color,
+                    is_bot: p.is_bot,
                     resource_count: p.resources.total(),
                     dev_card_count: p.total_cards(),
                     victory_points: vps,
@@ -305,6 +311,16 @@ impl Game {
         self.player_order[self.current_player_idx]
     }
 
+    /// Check an action against the complete game rules without changing this game.
+    ///
+    /// Runtime event subscribers are removed from the temporary clone, so probing
+    /// an action cannot publish events or otherwise produce external side effects.
+    pub fn is_action_legal(&self, player: PlayerId, action: Action) -> bool {
+        let mut probe = self.clone();
+        probe.event_subscribers.clear();
+        probe.apply_action(player, action).is_ok()
+    }
+
     /// Return a replayable log for this game.
     pub fn log(&self) -> GameLog {
         GameLog {
@@ -352,8 +368,10 @@ impl Game {
         }
 
         self.last_outcome = None;
-        let resources_before: Vec<Resources> =
-            self.players.iter().map(|p| p.resources).collect();
+        let resources_before: Vec<Resources> = self.players.iter().map(|p| p.resources).collect();
+        let longest_road_before = self.longest_road;
+        let largest_army_before = self.largest_army;
+        let winner_before = self.winner;
         let result = match self.phase {
             GamePhase::Finished => Err(CatanError::GameFinished),
             GamePhase::Setup { .. } => self.apply_setup_action(player, action),
@@ -368,6 +386,13 @@ impl Game {
                 action,
                 outcome: self.last_outcome.take().unwrap_or(EventOutcome::None),
                 resource_changes: self.resource_changes_from(&resources_before),
+                award_changes: Self::award_changes(
+                    longest_road_before,
+                    self.longest_road,
+                    largest_army_before,
+                    self.largest_army,
+                ),
+                winner: self.winner.filter(|_| self.winner != winner_before),
                 timestamp_ms: Self::now_ms(),
             };
             self.publish_event(event);
@@ -398,6 +423,30 @@ impl Game {
             }
         }
         changes.sort_by_key(|change| change.player);
+        changes
+    }
+
+    fn award_changes(
+        longest_before: Option<PlayerId>,
+        longest_after: Option<PlayerId>,
+        army_before: Option<PlayerId>,
+        army_after: Option<PlayerId>,
+    ) -> Vec<AwardChange> {
+        let mut changes = Vec::new();
+        if longest_before != longest_after {
+            changes.push(AwardChange {
+                award: GameAward::LongestRoad,
+                previous: longest_before,
+                holder: longest_after,
+            });
+        }
+        if army_before != army_after {
+            changes.push(AwardChange {
+                award: GameAward::LargestArmy,
+                previous: army_before,
+                holder: army_after,
+            });
+        }
         changes
     }
 
@@ -630,10 +679,17 @@ impl Game {
             self.phase = GamePhase::Turn(TurnPhase::Main);
             production
         };
+        let mut discards: Vec<DiscardDemand> = self
+            .pending_discards
+            .iter()
+            .map(|(&player, &count)| DiscardDemand { player, count })
+            .collect();
+        discards.sort_by_key(|demand| demand.player);
         self.last_outcome = Some(EventOutcome::DiceRoll {
             d1,
             d2,
             production,
+            discards,
         });
         Ok(())
     }
@@ -986,6 +1042,10 @@ impl Game {
         self.validate_play_dev_card(player, DevelopmentCard::Invention)?;
         self.players[player].resources.add(r1, 1);
         self.players[player].resources.add(r2, 1);
+        let mut resources = Resources::zero();
+        resources.add(r1, 1);
+        resources.add(r2, 1);
+        self.last_outcome = Some(EventOutcome::ResourcesGained { resources });
         self.players[player].remove_card(DevelopmentCard::Invention);
         self.played_dev_card_this_turn = true;
         Ok(())
@@ -1006,6 +1066,10 @@ impl Game {
         self.players[player]
             .resources
             .add(resource, total.min(u16::from(u8::MAX)) as u8);
+        self.last_outcome = Some(EventOutcome::Monopoly {
+            resource,
+            amount: total,
+        });
         self.players[player].remove_card(DevelopmentCard::Monopoly);
         self.played_dev_card_this_turn = true;
         Ok(())
@@ -1235,11 +1299,26 @@ impl Game {
             vps += self.longest_road_points(player_id);
             vps += self.largest_army_points(player_id);
             if vps >= 10 {
+                self.reveal_victory_point_cards(player_id);
                 self.winner = Some(player_id);
                 self.phase = GamePhase::Finished;
                 return;
             }
         }
+    }
+
+    fn reveal_victory_point_cards(&mut self, player: PlayerId) {
+        let p = &mut self.players[player];
+        let hidden = p
+            .hand
+            .iter()
+            .chain(&p.new_cards)
+            .filter(|&&card| card == DevelopmentCard::VictoryPoint)
+            .count() as u8;
+        p.hand.retain(|&card| card != DevelopmentCard::VictoryPoint);
+        p.new_cards
+            .retain(|&card| card != DevelopmentCard::VictoryPoint);
+        p.victory_point_cards += hidden;
     }
 
     /// Count public victory points from this player's settlements and cities.
@@ -2132,6 +2211,16 @@ mod tests {
         .unwrap();
         assert_eq!(game.players[player].resources.brick, 1);
         assert_eq!(game.players[player].resources.lumber, 1);
+        assert_eq!(
+            game.event_log.last().unwrap().outcome,
+            EventOutcome::ResourcesGained {
+                resources: Resources {
+                    brick: 1,
+                    lumber: 1,
+                    ..Default::default()
+                },
+            }
+        );
     }
 
     #[test]
@@ -2145,6 +2234,15 @@ mod tests {
         game.apply_action(player, Action::PlayInvention(Resource::Ore, Resource::Ore))
             .unwrap();
         assert_eq!(game.players[player].resources.ore, 2);
+        assert_eq!(
+            game.event_log.last().unwrap().outcome,
+            EventOutcome::ResourcesGained {
+                resources: Resources {
+                    ore: 2,
+                    ..Default::default()
+                },
+            }
+        );
     }
 
     #[test]
@@ -2166,6 +2264,13 @@ mod tests {
         assert_eq!(game.players[other].resources.grain, 0);
         assert_eq!(game.players[player].resources.grain, 3);
         assert_eq!(game.players[other].resources.brick, 2);
+        assert_eq!(
+            game.event_log.last().unwrap().outcome,
+            EventOutcome::Monopoly {
+                resource: Resource::Grain,
+                amount: 3,
+            }
+        );
         let mut expected = vec![
             ResourceDelta {
                 player,
@@ -2735,6 +2840,7 @@ mod tests {
             lumber: 5,
             ..Default::default()
         };
+        game.players[1].is_bot = true;
 
         let view = game.view_for(0);
         let me = view.players.iter().find(|p| p.is_me).unwrap();
@@ -2744,6 +2850,7 @@ mod tests {
         assert!(other.my_resources.is_none());
         assert!(other.my_hand.is_none());
         assert_eq!(other.resource_count, 5);
+        assert!(other.is_bot);
     }
 
     #[test]
@@ -2841,6 +2948,20 @@ mod tests {
 
         assert_eq!(game.longest_road_for_player(player), 5);
         assert_eq!(game.longest_road, Some(player));
+        let award = game
+            .event_log
+            .iter()
+            .rev()
+            .find(|event| !event.award_changes.is_empty())
+            .expect("longest road award logged");
+        assert_eq!(
+            award.award_changes,
+            vec![AwardChange {
+                award: GameAward::LongestRoad,
+                previous: None,
+                holder: Some(player),
+            }]
+        );
         let view = game.view_for(player);
         let mine = view.players.iter().find(|p| p.id == player).unwrap();
         // Two setup settlements plus the longest-road bonus.
@@ -3041,6 +3162,14 @@ mod tests {
 
         assert_eq!(game.players[player].played_knights, 3);
         assert_eq!(game.largest_army, Some(player));
+        assert!(
+            game.event_log.iter().any(|event| {
+                event.award_changes.iter().any(|change| {
+                    change.award == GameAward::LargestArmy && change.holder == Some(player)
+                })
+            }),
+            "largest army award should be logged"
+        );
         let view = game.view_for(player);
         let mine = view.players.iter().find(|p| p.id == player).unwrap();
         // Two setup settlements plus the largest-army bonus.
@@ -3337,6 +3466,22 @@ mod tests {
         game.players[player].new_cards = vec![DevelopmentCard::VictoryPoint; 10];
         game.check_winner();
         assert_eq!(game.winner, Some(player));
+        assert_eq!(game.players[player].victory_point_cards, 10);
+        assert!(
+            !game.players[player]
+                .hand
+                .iter()
+                .chain(&game.players[player].new_cards)
+                .any(|&card| card == DevelopmentCard::VictoryPoint)
+        );
+        let opponent_view = game.view_for(1 - player);
+        let winner_view = opponent_view
+            .players
+            .iter()
+            .find(|p| p.id == player)
+            .unwrap();
+        assert_eq!(winner_view.victory_points, 10);
+        assert!(winner_view.my_hand.is_none());
     }
 
     #[test]
@@ -3482,6 +3627,16 @@ mod tests {
             .filter(|e| matches!(e.outcome, EventOutcome::DiceRoll { .. }))
             .collect();
         assert_eq!(dice_events.len(), 1);
+        let EventOutcome::DiceRoll {
+            d1, d2, discards, ..
+        } = &dice_events[0].outcome
+        else {
+            panic!("expected dice roll outcome");
+        };
+        assert_eq!(d1 + d2, 7);
+        let mut expected_discards = discards.clone();
+        expected_discards.sort_by_key(|demand| demand.player);
+        assert_eq!(discards, &expected_discards);
 
         let robber_events: Vec<_> = game
             .event_log

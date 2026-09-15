@@ -153,7 +153,9 @@ export function GameScreen({ game, log, send, pending, setPending, robberTile, s
         )}
       </header>
 
-      <div className="status-bar">{statusMessage(game, current, me)}</div>
+      <div className={`status-bar${current.is_bot ? ' bot-turn' : ''}`}>
+        {statusMessage(game, current, me)}
+      </div>
 
       <div className="game-layout">
         <div className="board">
@@ -197,17 +199,26 @@ export function GameScreen({ game, log, send, pending, setPending, robberTile, s
   );
 }
 
+function playerLabel(player: PlayerView): string {
+  return player.is_bot ? `${player.name} (bot)` : player.name;
+}
+
 function statusMessage(game: GameView, current: PlayerView, me: PlayerView): string {
   if (typeof game.phase === 'object' && 'Setup' in game.phase) {
     const setup = game.phase.Setup;
     const action = setup.awaiting_road_for === null ? 'placing a settlement' : 'placing a road';
-    return `${current.name} is ${action} (setup ${setup.round === 0 ? '1' : '2'}).`;
+    return `${playerLabel(current)} is ${action} (setup ${setup.round === 0 ? '1' : '2'}).`;
   }
   if (game.winner !== null) {
     const winner = game.players.find((p) => p.id === game.winner);
-    return winner ? `${winner.name} wins!` : 'Game over';
+    return winner ? `${playerLabel(winner)} wins!` : 'Game over';
   }
-  const base = game.current_player === me.id ? 'Your turn' : `${current.name}'s turn`;
+  const base =
+    game.current_player === me.id
+      ? 'Your turn'
+      : current.is_bot
+        ? `${playerLabel(current)} is taking a turn`
+        : `${current.name}'s turn`;
   const phase = typeof game.phase === 'object' && 'Turn' in game.phase ? ` — ${game.phase.Turn}` : '';
   return `${base}${phase}`;
 }
@@ -215,10 +226,12 @@ function statusMessage(game: GameView, current: PlayerView, me: PlayerView): str
 function PlayerBadge({ player, isCurrent }: { player: PlayerView; isCurrent: boolean }) {
   return (
     <div
-      className={`player-badge ${isCurrent ? 'current' : ''}`}
+      className={`player-badge${isCurrent ? ' current' : ''}${player.is_bot ? ' is-bot' : ''}`}
       style={{ backgroundColor: colorMap[player.color] || '#888', color: player.color === 'White' ? '#111' : '#fff' }}
     >
-      {player.name} VP:{player.victory_points} RC:{player.resource_count}
+      {player.name}
+      {player.is_bot && <span className="bot-label">bot</span>}
+      {' '}VP:{player.victory_points} RC:{player.resource_count}
     </div>
   );
 }

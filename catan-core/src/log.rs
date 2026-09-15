@@ -17,6 +17,27 @@ pub struct ResourceDelta {
     pub lost: Resources,
 }
 
+/// How many cards a player must discard after a 7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscardDemand {
+    pub player: PlayerId,
+    pub count: u16,
+}
+
+/// Longest road or largest army changing as a result of an action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameAward {
+    LongestRoad,
+    LargestArmy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwardChange {
+    pub award: GameAward,
+    pub previous: Option<PlayerId>,
+    pub holder: Option<PlayerId>,
+}
+
 /// A non-deterministic outcome produced while handling an action.
 /// These values are recorded so a replay can reproduce the exact game state
 /// without needing to persist the RNG.
@@ -28,9 +49,19 @@ pub enum EventOutcome {
         d2: u8,
         #[serde(default)]
         production: Vec<ResourcePayout>,
+        #[serde(default)]
+        discards: Vec<DiscardDemand>,
     },
-    ResourceStolen { resource: Resource },
-    ResourcesGained { resources: Resources },
+    ResourceStolen {
+        resource: Resource,
+    },
+    ResourcesGained {
+        resources: Resources,
+    },
+    Monopoly {
+        resource: Resource,
+        amount: u16,
+    },
 }
 
 /// A single entry in a game's event log.
@@ -47,6 +78,12 @@ pub struct GameEvent {
     /// Per-player resource gains and losses caused by this action.
     #[serde(default)]
     pub resource_changes: Vec<ResourceDelta>,
+    /// Longest road / largest army holder changes caused by this action.
+    #[serde(default)]
+    pub award_changes: Vec<AwardChange>,
+    /// Set when this action caused a player to reach 10 victory points.
+    #[serde(default)]
+    pub winner: Option<PlayerId>,
     /// Unix time in milliseconds when the action was applied.
     #[serde(default)]
     pub timestamp_ms: u64,
@@ -60,6 +97,8 @@ impl GameEvent {
             && self.action == other.action
             && self.outcome == other.outcome
             && self.resource_changes == other.resource_changes
+            && self.award_changes == other.award_changes
+            && self.winner == other.winner
     }
 }
 

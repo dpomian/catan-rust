@@ -6,6 +6,8 @@ pub struct Player {
     pub id: PlayerId,
     pub name: String,
     pub color: PlayerColor,
+    #[serde(default)]
+    pub is_bot: bool,
     pub resources: Resources,
     pub hand: Vec<DevelopmentCard>,
     /// Cards bought this turn that cannot yet be played (except VP cards to win).
@@ -24,6 +26,7 @@ impl Player {
             id,
             name: name.into(),
             color,
+            is_bot: false,
             resources: Resources::zero(),
             hand: Vec::new(),
             new_cards: Vec::new(),
@@ -32,6 +35,14 @@ impl Player {
             remaining_roads: 15,
             remaining_settlements: 5,
             remaining_cities: 4,
+        }
+    }
+
+    /// Create a bot player with the standard starting pieces and empty resources/cards.
+    pub fn bot(id: PlayerId, name: impl Into<String>, color: PlayerColor) -> Self {
+        Self {
+            is_bot: true,
+            ..Self::new(id, name, color)
         }
     }
 
@@ -87,6 +98,7 @@ mod tests {
         assert_eq!(p.id, 2);
         assert_eq!(p.name, "Alice");
         assert_eq!(p.color, PlayerColor::Blue);
+        assert!(!p.is_bot);
         assert_eq!(p.resources, Resources::zero());
         assert!(p.hand.is_empty());
         assert!(p.new_cards.is_empty());
@@ -95,6 +107,25 @@ mod tests {
         assert_eq!(p.remaining_roads, 15);
         assert_eq!(p.remaining_settlements, 5);
         assert_eq!(p.remaining_cities, 4);
+    }
+
+    #[test]
+    fn bot_player_is_marked_as_bot() {
+        let p = Player::bot(1, "Bot", PlayerColor::Orange);
+        assert!(p.is_bot);
+        assert_eq!(p.name, "Bot");
+    }
+
+    #[test]
+    fn missing_is_bot_deserializes_as_false() {
+        let json = r#"{
+            "id":0,"name":"Legacy","color":"Red",
+            "resources":{"brick":0,"lumber":0,"ore":0,"grain":0,"wool":0},
+            "hand":[],"new_cards":[],"played_knights":0,"victory_point_cards":0,
+            "remaining_roads":15,"remaining_settlements":5,"remaining_cities":4
+        }"#;
+        let p: Player = serde_json::from_str(json).unwrap();
+        assert!(!p.is_bot);
     }
 
     #[test]

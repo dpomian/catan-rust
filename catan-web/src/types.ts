@@ -63,6 +63,7 @@ export interface PlayerView {
   remaining_roads: number;
   remaining_settlements: number;
   remaining_cities: number;
+  is_bot: boolean;
   is_me: boolean;
   my_resources?: Resources;
   my_hand?: DevelopmentCard[];
@@ -96,6 +97,7 @@ export interface LogPlayer {
   id: number;
   name: string;
   color: PlayerColor;
+  is_bot: boolean;
   resources: Resources;
   hand: DevelopmentCard[];
   new_cards: DevelopmentCard[];
@@ -117,11 +119,32 @@ export interface ResourceDelta {
   lost: Resources;
 }
 
+export interface DiscardDemand {
+  player: number;
+  count: number;
+}
+
+export type GameAward = 'LongestRoad' | 'LargestArmy';
+
+export interface AwardChange {
+  award: GameAward;
+  previous: number | null;
+  holder: number | null;
+}
+
 export type EventOutcome =
   | 'None'
-  | { DiceRoll: { d1: number; d2: number; production?: ResourcePayout[] } }
+  | {
+      DiceRoll: {
+        d1: number;
+        d2: number;
+        production?: ResourcePayout[];
+        discards?: DiscardDemand[];
+      };
+    }
   | { ResourceStolen: { resource: Resource } }
-  | { ResourcesGained: { resources: Resources } };
+  | { ResourcesGained: { resources: Resources } }
+  | { Monopoly: { resource: Resource; amount: number } };
 
 export interface GameEvent {
   sequence: number;
@@ -129,6 +152,8 @@ export interface GameEvent {
   action: Action;
   outcome: EventOutcome;
   resource_changes?: ResourceDelta[];
+  award_changes?: AwardChange[];
+  winner?: number | null;
   timestamp_ms?: number;
 }
 
@@ -150,12 +175,15 @@ export interface LobbyPlayer {
   id: number;
   name: string;
   color: PlayerColor;
+  is_bot: boolean;
 }
 
 export type ClientMessage =
   | { type: 'CreateGame'; name: string }
   | { type: 'JoinGame'; code: string; name: string }
   | { type: 'StartGame' }
+  | { type: 'AddBot' }
+  | { type: 'RemoveBot'; id: number }
   | { type: 'Action'; action: Action }
   | { type: 'RequestLog' };
 

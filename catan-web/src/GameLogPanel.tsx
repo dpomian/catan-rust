@@ -92,6 +92,25 @@ function emptyResources(): Resources {
   return { brick: 0, lumber: 0, ore: 0, grain: 0, wool: 0 };
 }
 
+function awardText(
+  event: GameEvent,
+  nameOf: (id: number) => string,
+): string[] {
+  const lines: string[] = [];
+  for (const change of event.award_changes ?? []) {
+    const award = change.award === 'LongestRoad' ? 'Longest Road' : 'Largest Army';
+    if (change.holder === null) {
+      lines.push(`${award} is no longer held`);
+    } else {
+      lines.push(`${nameOf(change.holder)} took ${award}`);
+    }
+  }
+  if (event.winner != null) {
+    lines.push(`${nameOf(event.winner)} won the game`);
+  }
+  return lines;
+}
+
 function formatTimestamp(ms?: number): string | null {
   if (!ms) return null;
   return new Date(ms).toLocaleTimeString([], {
@@ -107,8 +126,15 @@ function formatEvent(event: GameEvent, nameOf: (id: number) => string, board: Bo
 
   if (a === 'RollDice') {
     if (typeof event.outcome === 'object' && 'DiceRoll' in event.outcome) {
-      const { d1, d2 } = event.outcome.DiceRoll;
-      return `${who} rolled ${d1} and ${d2} (${d1 + d2} total)`;
+      const { d1, d2, discards } = event.outcome.DiceRoll;
+      const total = d1 + d2;
+      if (total === 7 && discards && discards.length > 0) {
+        const whoMust = discards
+          .map((demand) => `${nameOf(demand.player)} discards ${demand.count}`)
+          .join(', ');
+        return `${who} rolled ${d1} and ${d2} (7 total); ${whoMust}`;
+      }
+      return `${who} rolled ${d1} and ${d2} (${total} total)`;
     }
     return `${who} rolled the dice`;
   }
@@ -140,7 +166,13 @@ function formatEvent(event: GameEvent, nameOf: (id: number) => string, board: Bo
     const [r1, r2] = a.PlayInvention;
     return `${who} played Invention for ${r1.toLowerCase()} and ${r2.toLowerCase()}`;
   }
-  if ('PlayMonopoly' in a) return `${who} played Monopoly on ${a.PlayMonopoly.toLowerCase()}`;
+  if ('PlayMonopoly' in a) {
+    if (typeof event.outcome === 'object' && 'Monopoly' in event.outcome) {
+      const { resource, amount } = event.outcome.Monopoly;
+      return `${who} played Monopoly on ${resource.toLowerCase()} and took ${amount}`;
+    }
+    return `${who} played Monopoly on ${a.PlayMonopoly.toLowerCase()}`;
+  }
   if ('OfferTrade' in a) {
     return `${who} offered ${formatResources(a.OfferTrade.give)} for ${formatResources(a.OfferTrade.receive)}`;
   }
@@ -182,6 +214,7 @@ export function GameLogPanel({ log, players, board }: GameLogPanelProps) {
             const info = playerInfo.get(event.player);
             const color = info ? nameColor[info.color] : '#555';
             const line = formatEvent(event, nameOf, board);
+            const awards = awardText(event, nameOf);
             const changes = eventResourceChanges(event);
             const time = formatTimestamp(event.timestamp_ms);
             return (
@@ -224,6 +257,11 @@ export function GameLogPanel({ log, players, board }: GameLogPanelProps) {
                       ));
                     })
                   ))}
+                {awards.map((detail) => (
+                  <p className="game-log-entry game-log-detail" key={detail}>
+                    {detail}
+                  </p>
+                ))}
               </div>
             );
           })

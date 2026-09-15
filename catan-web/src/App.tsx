@@ -5,6 +5,8 @@ import type { Action } from './types';
 import type { Pending } from './Controls';
 import './App.css';
 
+const MAX_PLAYERS = 4;
+
 const colorMap: Record<string, string> = {
   Red: '#d32f2f',
   Blue: '#1976d2',
@@ -56,6 +58,10 @@ function App() {
   }
 
   if (lobby) {
+    const isHost = lobby.you === lobby.host;
+    const seatsLeft = MAX_PLAYERS - lobby.players.length;
+    const canStart = isHost && lobby.players.length >= 2;
+
     return (
       <div className="app">
         <h1>Catan Lobby</h1>
@@ -65,20 +71,40 @@ function App() {
         </div>
         <ul className="lobby-list">
           {lobby.players.map((p) => (
-            <li key={p.id} className="lobby-player">
+            <li key={p.id} className={`lobby-player${p.is_bot ? ' is-bot' : ''}`}>
               <span className="color-dot" style={{ backgroundColor: colorMap[p.color] }} />
               <span>{p.name}</span>
+              {p.is_bot && <span className="bot-label">bot</span>}
               {p.id === lobby.you && <span>(you)</span>}
               {p.id === lobby.host && <span>— host</span>}
+              {isHost && p.is_bot && (
+                <button
+                  className="remove-bot"
+                  onClick={() => send({ type: 'RemoveBot', id: p.id })}
+                >
+                  Remove
+                </button>
+              )}
             </li>
           ))}
         </ul>
-        {lobby.you === lobby.host && lobby.players.length >= 2 && (
-          <button onClick={startGame}>Start Game</button>
+        {isHost && (
+          <div className="lobby-bot-controls">
+            <button
+              disabled={seatsLeft <= 0}
+              onClick={() => send({ type: 'AddBot' })}
+            >
+              Add Bot
+            </button>
+            <span className="lobby-capacity">
+              {seatsLeft > 0
+                ? `${seatsLeft} seat${seatsLeft === 1 ? '' : 's'} left`
+                : 'Lobby full (4 players)'}
+            </span>
+          </div>
         )}
-        {lobby.you === lobby.host && lobby.players.length < 2 && (
-          <p>Waiting for more players…</p>
-        )}
+        {canStart && <button onClick={startGame}>Start Game</button>}
+        {isHost && lobby.players.length < 2 && <p>Waiting for more players…</p>}
       </div>
     );
   }

@@ -9,3 +9,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+
+[[test]]
+name = "bot_games"
+path = "tests/bot_games.rs"
+harness = false
